@@ -78,19 +78,23 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
     return parser
 
 
-def create_nemotron_parse_pdf_pipeline(
+def create_nemotron_parse_pdf_pipeline(  # noqa: PLR0913
     args: argparse.Namespace,
     *,
     inprocess_backend: str = "vllm",
     inference_server_endpoint: str | None = None,
     inference_server_model_name: str | None = None,
     inference_server_client_num_workers: int = 4,
+    validate_images: bool = False,
 ) -> Pipeline:
     """Build the PDF pipeline, optionally using an inference server.
 
     For an inference-server deployment, use four HTTP client workers per
     serving GPU and start with ``args.inference_batch_size=32``. Tune request
     concurrency on the target hardware and corpus.
+
+    ``validate_images`` enables non-dropping image validation for comparisons
+    and requires the optional OpenCV extra.
     """
     pipeline = Pipeline(
         name="nemotron_parse_pdf",
@@ -125,6 +129,25 @@ def create_nemotron_parse_pdf_pipeline(
             inference_server_max_retries=getattr(args, "inference_server_max_retries", 3),
         )
     )
+    if validate_images:
+        from nemo_curator.stages.interleaved import InterleavedAspectRatioFilterStage
+        from nemo_curator.stages.interleaved.filter.blur_filter import InterleavedBlurFilterStage
+
+        pipeline.add_stage(
+            InterleavedAspectRatioFilterStage(
+                min_aspect_ratio=0.0,
+                max_aspect_ratio=float("inf"),
+                drop_invalid_rows=False,
+                preserve_metadata_only_samples=True,
+            )
+        )
+        pipeline.add_stage(
+            InterleavedBlurFilterStage(
+                score_threshold=0.0,
+                drop_invalid_rows=False,
+                preserve_metadata_only_samples=True,
+            )
+        )
     pipeline.add_stage(
         InterleavedParquetWriterStage(
             path=args.output_dir,

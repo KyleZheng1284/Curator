@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import io
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import pandas as pd
@@ -65,9 +65,14 @@ class BaseInterleavedAnnotatorStage(ProcessingStage[InterleavedBatch, Interleave
 
 @dataclass
 class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
-    """Base stage for interleaved filtering based on a keep-mask."""
+    """Base stage for interleaved filtering based on a keep-mask.
+
+    Metadata-only samples may be retained explicitly. Metadata orphaned because
+    this stage removed all of a sample's content remains filtered out.
+    """
 
     drop_invalid_rows: bool = True
+    preserve_metadata_only_samples: bool = field(default=False, kw_only=True)
     name: str = "base_interleaved_filter"
 
     @abstractmethod
@@ -118,6 +123,7 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
             yield idx, bytes(row_bytes) if isinstance(row_bytes, (bytes, bytearray)) else None
 
     def annotate(self, task: InterleavedBatch, df: pd.DataFrame) -> pd.DataFrame:
+        original_content_sample_ids = set(df.loc[df["modality"] != "metadata", "sample_id"])
         filtered = df[self.keep_mask(task, df)].copy()
         content_mask = filtered["modality"] != "metadata"
         if content_mask.any():
@@ -126,6 +132,8 @@ class BaseInterleavedFilterStage(BaseInterleavedAnnotatorStage, ABC):
             filtered.loc[content_mask, "position"] = reindexed.astype(filtered["position"].dtype)
         content_sample_ids = set(filtered.loc[content_mask, "sample_id"])
         orphan_mask = (~content_mask) & (~filtered["sample_id"].isin(content_sample_ids))
+        if self.preserve_metadata_only_samples:
+            orphan_mask &= filtered["sample_id"].isin(original_content_sample_ids)
         filtered = filtered[~orphan_mask]
         return filtered.sort_values(["sample_id", "position"])
 
