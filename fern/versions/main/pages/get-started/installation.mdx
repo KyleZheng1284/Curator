@@ -332,6 +332,18 @@ With `--with-libopenh264`, the resulting FFmpeg binary links Cisco OpenH264. You
 
 ---
 
+## Experimental NRL PDF environment
+
+A separate source-checkout profile in `environments/nrl-pdf/` provides a Python 3.12,
+Linux x86_64 environment for Curator interleaved CPU stages and Lance alongside NRL's
+CUDA 13 inference stack. Follow the profile README to build the local project wheels
+and install its lockfile. It requires the separate NRL urllib3 compatibility update;
+it is not an upstream released environment or a replacement for Curator's root install.
+
+This profile does not qualify audio, RAPIDS, SDG or other optional families on the
+new stack. Parse 1.2 runs locally; the tested Parse 3.5 configuration uses a separate
+serving environment because its dependency pins differ.
+
 ## Installation Verification
 
 After installation, run an import check. A successful check prints the installed version and confirms core modules can be imported:
