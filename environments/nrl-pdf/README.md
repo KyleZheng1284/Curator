@@ -65,6 +65,26 @@ environment. The separately tested HTTP adapter is experimental and is not
 provided by this dependency profile. This is not a single-environment Parse 3.5
 installation.
 
+## Container
+
+After building the pinned wheels, build from this profile directory:
+
+```bash
+docker build --tag curator-nrl-pdf:experimental .
+docker run --rm curator-nrl-pdf:experimental
+```
+
+The image uses CUDA 13, Python 3.12 and the same lock. It follows the root
+Dockerfile's base-package and Nsight patching steps. Model weights are supplied
+separately through a read-only mount; keep writable model-code and compilation
+caches separate. Offline Parse 1.2 also requires its referenced C-RADIO code
+snapshot in the mounted Hugging Face cache; mounting only the Parse weights is
+insufficient. Keep both snapshots pinned and read-only.
+When running as a numeric UID, supply a valid `LOGNAME` and
+explicit writable `TORCHINDUCTOR_CACHE_DIR` and `TRITON_CACHE_DIR` paths.
+Only the assigned GPU should be exposed to a run. Parse 3.5 still needs the
+separate serving environment described above.
+
 ## Validation scope
 
 The isolated profile must pass clean installation, locked resynchronization,

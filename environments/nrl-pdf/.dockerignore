@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!wheels/
+!wheels/*.whl
+!wheels/build-receipt.json
