@@ -16,6 +16,7 @@ import os
 import struct
 import time
 import uuid
+from pathlib import Path
 from typing import Any
 from unittest import mock
 from unittest.mock import Mock, patch
@@ -39,7 +40,7 @@ def mock_tokenizer() -> Mock:
     tokenizer.vocab_size = 2**12
     tokenizer.eos_token_id = 1
 
-    def mock_batch_encode_plus(texts: list[str], **kwargs: Any) -> MockTokenizerOutput:  # noqa: ANN401 ARG001
+    def mock_tokenize(texts: list[str], **kwargs: Any) -> MockTokenizerOutput:  # noqa: ANN401 ARG001
         input_ids: list[list[int]] = []
         attention_masks: list[list[int]] = []
 
@@ -57,7 +58,7 @@ def mock_tokenizer() -> Mock:
 
         return MockTokenizerOutput(input_ids, attention_masks)
 
-    tokenizer.batch_encode_plus = mock_batch_encode_plus
+    tokenizer.side_effect = mock_tokenize
     return tokenizer
 
 
@@ -87,7 +88,7 @@ def test_mocks_are_working_automatically(tmpdir: str):
     assert stage.tokenizer is not None
     assert stage.tokenizer.vocab_size is not None
     assert stage.tokenizer.eos_token_id is not None
-    assert hasattr(stage.tokenizer, "batch_encode_plus")
+    assert callable(stage.tokenizer)
 
 
 class TestMegatronTokenizerWriter:
@@ -429,3 +430,28 @@ class TestMegatronTokenizerWriter:
         assert os.path.getsize(result1.data[1]) == os.path.getsize(result2.data[1]), (
             f"File sizes should be equal, got {os.path.getsize(result1.data[1])} and {os.path.getsize(result2.data[1])}"
         )
+
+
+def test_real_tokenizer_writes_expected_token_ids(tmp_path: Path):
+    import pandas as pd
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1, "alpha": 2, "beta": 3, "[EOS]": 4}, unk_token="[UNK]"))  # noqa: S106
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",  # noqa: S106
+        pad_token="[PAD]",  # noqa: S106
+        eos_token="[EOS]",  # noqa: S106
+    )
+
+    writer = MegatronTokenizerWriter(path=str(tmp_path / "tokens"), model_identifier="local/fixture", append_eod=True)
+    writer.tokenizer = tokenizer
+    batch = DocumentBatch(dataset_name="fixture", data=pd.DataFrame({"text": ["alpha beta", "beta"]}))
+    result = writer.process(batch)
+    binary_path = next(path for path in result.data if path.endswith(".bin"))
+    assert np.fromfile(binary_path, dtype=np.uint16).tolist() == [2, 3, 4, 3, 4]
+    assert result._metadata["num_tokens"] == 5

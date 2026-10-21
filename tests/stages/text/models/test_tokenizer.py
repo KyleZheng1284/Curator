@@ -43,7 +43,7 @@ def mock_tokenizer() -> Mock:
     tokenizer.unk_token = "[UNK]"  # noqa: S105
     tokenizer.padding_side = "right"
 
-    def mock_batch_encode_plus(texts: list[str], **kwargs: Any) -> MockTokenizerOutput:  # noqa: ANN401
+    def mock_tokenize(texts: list[str], **kwargs: Any) -> MockTokenizerOutput:  # noqa: ANN401
         input_ids: list[list[int]] = []
         attention_masks: list[list[int]] = []
         max_length = kwargs.get("max_length", 512)
@@ -66,7 +66,7 @@ def mock_tokenizer() -> Mock:
 
         return MockTokenizerOutput(input_ids, attention_masks)
 
-    tokenizer.batch_encode_plus = mock_batch_encode_plus
+    tokenizer.side_effect = mock_tokenize
     return tokenizer
 
 
@@ -119,7 +119,7 @@ def test_mocks_are_working_automatically():
 
     # Verify the tokenizer was mocked correctly
     assert stage.tokenizer is not None
-    assert hasattr(stage.tokenizer, "batch_encode_plus")
+    assert callable(stage.tokenizer)
 
 
 def test_tokenizer_stage_sort_by_length_enabled(sample_document_batch: DocumentBatch):
@@ -200,3 +200,27 @@ def test_tokenizer_stage_max_seq_length_fallback(setup_mocks: dict[str, Mock]):
 
     stage.setup()
     assert stage.max_seq_length == 512
+
+
+def test_real_tokenizer_padding_truncation_and_order():
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1, "alpha": 2, "beta": 3, "[EOS]": 4}, unk_token="[UNK]"))  # noqa: S106
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",  # noqa: S106
+        pad_token="[PAD]",  # noqa: S106
+        eos_token="[EOS]",  # noqa: S106
+    )
+
+    stage = TokenizerStage(model_identifier="local/fixture", max_seq_length=3, sort_by_length=True)
+    stage.tokenizer = tokenizer
+    batch = DocumentBatch(dataset_name="fixture", data=pd.DataFrame({"text": ["alpha beta alpha beta", "beta"]}))
+    result = stage.process(batch).to_pandas()
+    assert result[INPUT_ID_FIELD].tolist() == [[3, 1, 1], [2, 3, 2]]
+    assert result[ATTENTION_MASK_FIELD].tolist() == [[1, 0, 0], [1, 1, 1]]
+    assert result[SEQ_ORDER_FIELD].tolist() == [1, 0]

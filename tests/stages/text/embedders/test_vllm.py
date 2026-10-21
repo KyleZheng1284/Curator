@@ -268,3 +268,30 @@ class TestVLLMEmbeddingModelStage:
                 assert metrics["tokenization_time"] >= 0
         finally:
             vllm_stage.teardown()
+
+
+def test_real_tokenizer_builds_truncated_vllm_prompts():
+    from types import SimpleNamespace
+
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+    from tokenizers.pre_tokenizers import Whitespace
+    from transformers import PreTrainedTokenizerFast
+
+    from nemo_curator.stages.text.embedders.vllm import VLLMEmbeddingModelStage
+
+    backend = Tokenizer(WordLevel({"[UNK]": 0, "[PAD]": 1, "alpha": 2, "beta": 3, "[EOS]": 4}, unk_token="[UNK]"))  # noqa: S106
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",  # noqa: S106
+        pad_token="[PAD]",  # noqa: S106
+        eos_token="[EOS]",  # noqa: S106
+    )
+
+    stage = VLLMEmbeddingModelStage(model_identifier="local/fixture", pretokenize=True)
+    stage.tokenizer = tokenizer
+    stage.model = SimpleNamespace(model_config=SimpleNamespace(max_model_len=2))
+    prompts, elapsed = stage._prepare_input_chunk(pa.chunked_array([["alpha beta alpha", "beta"]]), 0, 2)
+    assert [prompt["prompt_token_ids"] for prompt in prompts] == [[2, 3], [3]]
+    assert elapsed >= 0
