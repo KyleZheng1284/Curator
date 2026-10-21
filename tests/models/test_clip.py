@@ -111,7 +111,7 @@ class TestCLIPImageEmbeddings:
         mock_model_instance.eval.assert_called_once()
 
         # Verify processor setup
-        mock_processor.from_pretrained.assert_called_once_with(weight_file)
+        mock_processor.from_pretrained.assert_called_once_with(weight_file, use_fast=False)
 
         assert self.model.clip == mock_model_instance
         assert self.model.processor == mock_processor_instance

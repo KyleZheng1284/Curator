@@ -59,7 +59,8 @@ class CLIPImageEmbeddings(ModelInterface):
         """Set up the CLIPImageEmbeddings model."""
         weight_file = str(Path(self.model_dir) / self.model_id_names[0])
         self.clip = CLIPModel.from_pretrained(weight_file).to(self.device).eval()
-        self.processor = CLIPProcessor.from_pretrained(weight_file)
+        # Preserve the PIL resize behavior across Transformers processor defaults.
+        self.processor = CLIPProcessor.from_pretrained(weight_file, use_fast=False)
 
         # torchvision transforms that match CLIP preprocessor_config.json
         # (https://huggingface.co/openai/clip-vit-base-patch32/blob/main/preprocessor_config.json)
