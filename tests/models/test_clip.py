@@ -20,6 +20,8 @@ from unittest.mock import Mock, patch
 import numpy as np
 import pytest
 import torch
+from torchvision import transforms
+from transformers import CLIPConfig, CLIPModel
 
 from nemo_curator.models.clip import CLIPAestheticScorer, CLIPImageEmbeddings
 
@@ -252,6 +254,60 @@ class TestCLIPImageEmbeddings:
         assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5)
         expected = embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)
         assert torch.allclose(out, expected, atol=1e-5)
+
+    @pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=pytest.mark.gpu)])
+    @pytest.mark.parametrize("return_dict", [True, False])
+    @pytest.mark.parametrize("modality", ["image", "text"])
+    def test_real_clip_features_match_forward(self, return_dict: bool, modality: str, device: str) -> None:
+        """Feature helpers must return projected, normalized tensors across Transformers versions."""
+        config = CLIPConfig(
+            text_config={
+                "vocab_size": 16,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "max_position_embeddings": 8,
+                "bos_token_id": 1,
+                "eos_token_id": 2,
+                "pad_token_id": 0,
+            },
+            vision_config={
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 4,
+                "image_size": 16,
+                "patch_size": 8,
+            },
+            projection_dim=16,
+            return_dict=return_dict,
+        )
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(0)
+            clip = CLIPModel(config).eval().to(device)
+        model = CLIPImageEmbeddings(model_dir="unused")
+        model.device = device
+        model.clip = clip
+        model.transforms = transforms.ConvertImageDtype(torch.float32)
+        images = np.random.default_rng(0).integers(0, 256, size=(2, 16, 16, 3), dtype=np.uint8)
+        inputs = {
+            "input_ids": torch.tensor([[1, 4, 2, 0], [1, 5, 2, 0]]),
+            "attention_mask": torch.tensor([[1, 1, 1, 0], [1, 1, 1, 0]]),
+        }
+        model.processor = Mock(return_value=inputs)
+        pixels = model.transforms(torch.from_numpy(images).permute(0, 3, 1, 2))
+        clip.config.return_dict = True
+        with torch.no_grad():
+            reference = clip(
+                pixel_values=pixels.to(device), **{k: v.to(device) for k, v in inputs.items()}, return_dict=True
+            )
+        clip.config.return_dict = return_dict
+        actual = model(images) if modality == "image" else model.encode_text(["first", "second"])
+        expected = reference.image_embeds if modality == "image" else reference.text_embeds
+        assert actual.shape == (2, 16)
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(torch.linalg.vector_norm(actual, dim=-1), torch.ones(2, device=device))
 
 
 class TestCLIPAestheticScorer:

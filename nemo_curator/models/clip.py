@@ -102,6 +102,9 @@ class CLIPImageEmbeddings(ModelInterface):
             inputs = inputs.to(self.device)
 
         embed = self.clip.get_image_features(pixel_values=inputs)
+        # Transformers 5 returns the projected pooler output; Transformers 4 returns a tensor.
+        if not isinstance(embed, torch.Tensor):
+            embed = embed[1] if isinstance(embed, tuple) else embed.pooler_output
 
         # Normalize embeddings
         return embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)  # type: ignore[no-any-return]
@@ -122,6 +125,8 @@ class CLIPImageEmbeddings(ModelInterface):
         inputs = self.processor(text=texts, return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         embed = self.clip.get_text_features(**inputs)
+        if not isinstance(embed, torch.Tensor):
+            embed = embed[1] if isinstance(embed, tuple) else embed.pooler_output
         return embed / torch.linalg.vector_norm(embed, dim=-1, keepdim=True)  # type: ignore[no-any-return]
 
     @classmethod
