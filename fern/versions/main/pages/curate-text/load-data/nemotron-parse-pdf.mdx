@@ -240,6 +240,7 @@ existing positional reader and HTTP-client calls remain compatible.
 | `parse_mode` | str \| None | `None` | Public reader opt-in to served Parse 3.5 `single`, `double`, or `triple` mode. |
 | `pdfs_per_task` | int | `10` | PDFs per task; ignored when `pages_per_task` is set. |
 | `pages_per_task` | int \| None | `None` | Optional selected-page budget per task; requires served Parse 3.5 single mode, Ray Data, and a counted/versioned manifest. |
+| `page_task_priorities` | dict[str, float] \| None | `None` | Optional submission priorities keyed by page-task fingerprint. Requires `pages_per_task`. |
 | `page_budget_extraction_config` | dict \| None | `None` | Resolved extraction identity required with `pages_per_task`; see [Page-Based Tasking](#page-based-tasking). |
 | `max_pdfs` | int \| None | `None` | Hard cap on total PDFs processed (debug aid). |
 | `dpi` | int | `300` | Render DPI for PDF pages. |
@@ -707,6 +708,36 @@ available on the nodes that read or serve them. Document regrouping remains a
 global barrier, and planning, inventory validation, and final results are materialized in memory. Size the
 workload and driver for these requirements; a page budget does not bound total
 pipeline memory or make regrouping checkpoint-resumable.
+
+#### Prioritize Page Tasks
+
+Use the Python option `page_task_priorities` to submit already packed tasks in
+descending cost order. A known slow render can start earlier and leave less work
+at the end of a run. Ray Data manages actual worker start and completion order.
+Priorities preserve each task's page selection, partition index, and document
+regrouping.
+
+To collect fingerprints, plan tasks with the same manifest, page budget, and
+manifest-selection options as the reader. This call only plans the tasks.
+
+```python
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import (
+    PDFPartitioningStage,
+    page_task_fingerprint,
+)
+from nemo_curator.tasks import EmptyTask
+
+partitioner = PDFPartitioningStage(manifest_path="counted-versioned.jsonl", pages_per_task=64)
+tasks = partitioner.process(EmptyTask())
+fingerprints = [page_task_fingerprint(task) for task in tasks]
+```
+
+Record render cost from a prior run under each packed task's fingerprint. Pass a
+mapping from those fingerprints to their costs as `page_task_priorities` to
+`NemotronParsePDFReader` or `PDFPartitioningStage`. Values must be finite and
+nonnegative. Unlisted tasks have priority zero. Equal priorities retain the
+original task order. Curator rejects keys that match no task in the current plan,
+so regenerate the mapping when task membership changes.
 
 ### Select a Page Subset
 

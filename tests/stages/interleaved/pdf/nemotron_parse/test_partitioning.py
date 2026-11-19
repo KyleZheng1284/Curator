@@ -6,7 +6,10 @@ from pathlib import Path
 
 import pytest
 
-from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import PDFPartitioningStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import (
+    PDFPartitioningStage,
+    page_task_fingerprint,
+)
 from nemo_curator.tasks import EmptyTask
 from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import partition, write_manifest
 
@@ -76,3 +79,56 @@ def test_page_budget_does_not_rebind_legacy_positional_partitioner_arguments():
     assert (stage.max_pdfs, stage.dataset_name, stage.name) == (17, "dataset", "legacy")
     assert stage.resources.cpus == 2
     assert stage.pages_per_task is None
+
+
+def test_page_priorities_reorder_complete_tasks_with_stable_ties(tmp_path: Path):
+    manifest, stock = partition(
+        tmp_path,
+        [
+            {"file_name": "a.pdf", "selected_page_indices": [19, 2, 7, 0, 11]},
+            {"file_name": "b.pdf", "selected_page_indices": [6, 5, 3]},
+        ],
+        size=2,
+    )
+    settings = {"manifest_path": str(manifest), "pages_per_task": 2}
+    priorities = {
+        page_task_fingerprint(stock[1]): 9.0,
+        page_task_fingerprint(stock[2]): 4.0,
+        page_task_fingerprint(stock[3]): 9.0,
+    }
+    ranked = PDFPartitioningStage(**settings, page_task_priorities=priorities).process(EmptyTask())
+    assert [task._metadata["partition_index"] for task in ranked] == [1, 3, 2, 0]
+    for task in ranked:
+        original = stock[task._metadata["partition_index"]]
+        assert task.data == original.data
+        assert task._metadata == original._metadata
+
+    unchanged = PDFPartitioningStage(**settings, page_task_priorities={}).process(EmptyTask())
+    assert [task.data for task in unchanged] == [task.data for task in stock]
+
+
+def test_page_priorities_reject_hints_after_source_version_changes(tmp_path: Path):
+    manifest, stock = partition(tmp_path, [{"file_name": "a.pdf", "num_pages": 1}])
+    priorities = {page_task_fingerprint(stock[0]): 3.0}
+    write_manifest(tmp_path, [{"file_name": "a.pdf", "num_pages": 1, "source_version": "new-version"}])
+
+    with pytest.raises(ValueError, match="fingerprint absent"):
+        PDFPartitioningStage(manifest_path=str(manifest), pages_per_task=64, page_task_priorities=priorities).process(
+            EmptyTask()
+        )
+
+
+@pytest.mark.parametrize("weight", [-1.0, float("nan"), float("inf"), True, "3"])
+def test_page_priorities_reject_invalid_weights(tmp_path: Path, weight: object):
+    manifest, stock = partition(tmp_path, [{"file_name": "a.pdf", "num_pages": 1}])
+    with pytest.raises(ValueError, match="finite, nonnegative costs"):
+        PDFPartitioningStage(
+            manifest_path=str(manifest),
+            pages_per_task=64,
+            page_task_priorities={page_task_fingerprint(stock[0]): weight},
+        ).process(EmptyTask())
+
+
+def test_page_priorities_require_page_mode():
+    with pytest.raises(ValueError, match="pages_per_task"):
+        PDFPartitioningStage(manifest_path="unused.jsonl", page_task_priorities={"a" * 64: 1.0})

@@ -63,6 +63,8 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     pages_per_task
         Opt-in page-only task budget. Pack across documents and split long PDFs
         without dropping pages. Requires served single mode and RayDataExecutor.
+    page_task_priorities
+        Optional costs of already packed page tasks by fingerprint. Higher costs are submitted first.
     max_pdfs
         Maximum PDFs to process (for testing).
     dpi
@@ -117,6 +119,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     backend: str = "vllm"
     pdfs_per_task: int = 10
     pages_per_task: int | None = field(default=None, kw_only=True)
+    page_task_priorities: dict[str, float] | None = field(default=None, kw_only=True)
     page_budget_extraction_config: dict | None = field(default=None, kw_only=True)
     max_pdfs: int | None = None
     dpi: int = 300
@@ -165,6 +168,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
             manifest_path=self.manifest_path,
             pdfs_per_task=self.pdfs_per_task,
             pages_per_task=self.pages_per_task,
+            page_task_priorities=self.page_task_priorities,
             max_pdfs=self.max_pdfs,
             dataset_name=self.dataset_name,
             file_name_field=self.file_name_field,

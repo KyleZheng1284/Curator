@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -29,6 +30,17 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
 )
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, FileGroupTask
+
+
+def page_task_fingerprint(task: FileGroupTask) -> str:
+    """Identify the ordered PDF versions and physical page selections of a packed page task."""
+    if "pdf_page_chunks" not in task._metadata:
+        msg = "A page task fingerprint requires a page-budgeted task"
+        raise ValueError(msg)
+    entries = (json.loads(item) for item in task.data)
+    return identity_digest(
+        [[entry["file_name"], entry["source_version"], entry["selected_page_indices"]] for entry in entries]
+    )
 
 
 @dataclass
@@ -59,6 +71,9 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
     pages_per_task
         Sole task-size limit in page mode. Every task except the final tail
         contains this many selected pages, independent of document boundaries.
+    page_task_priorities
+        Optional costs keyed by :func:`page_task_fingerprint`. Higher values are emitted first.
+        Missing costs are zero. Equal costs preserve partition order.
     max_pdfs
         If set, limit the total number of PDFs to process.
     dataset_name
@@ -79,6 +94,7 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
     file_names_field: str = "cc_pdf_file_names"
     url_field: str = "url"
     pages_per_task: int | None = field(default=None, kw_only=True)
+    page_task_priorities: dict[str, float] | None = field(default=None, kw_only=True)
     name: str = "pdf_partitioning"
     resources: Resources = field(default_factory=lambda: Resources(cpus=0.5))
     _parser_config: dict = field(default_factory=dict, init=False, repr=False)
@@ -90,6 +106,19 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 msg = "pages_per_task must be a positive integer"
                 raise ValueError(msg)
+        if self.page_task_priorities is not None:
+            if self.pages_per_task is None:
+                msg = "page_task_priorities requires pages_per_task"
+                raise ValueError(msg)
+            for fingerprint, weight in self.page_task_priorities.items():
+                if (
+                    not isinstance(fingerprint, str)
+                    or type(weight) not in (int, float)
+                    or weight < 0
+                    or (isinstance(weight, float) and not math.isfinite(weight))
+                ):
+                    msg = "page_task_priorities requires task fingerprint keys and finite, nonnegative costs"
+                    raise ValueError(msg)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return [], []
@@ -151,7 +180,8 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
     def process(self, _: EmptyTask) -> list[FileGroupTask]:
         entries = self._parse_manifest()
         if self.pages_per_task is not None:
-            return self._chunk_tasks(entries)
+            tasks = self._chunk_tasks(entries)
+            return self._order_page_tasks(tasks) if self.page_task_priorities else tasks
 
         tasks: list[FileGroupTask] = []
         for i in range(0, len(entries), self.pdfs_per_task):
@@ -205,6 +235,15 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
             tasks.append(self._make_page_task(batch, len(tasks)))
         logger.info(f"Created {len(tasks)} page-budget tasks from {len(entries)} PDFs")
         return tasks
+
+    def _order_page_tasks(self, tasks: list[FileGroupTask]) -> list[FileGroupTask]:
+        priorities = self.page_task_priorities or {}
+        fingerprints = {task._metadata["partition_index"]: page_task_fingerprint(task) for task in tasks}
+        if priorities.keys() - fingerprints.values():
+            msg = "page_task_priorities contains a fingerprint absent from the packed page tasks"
+            raise ValueError(msg)
+        # Sort only after packing so priorities cannot change document or partition membership.
+        return sorted(tasks, key=lambda task: -priorities.get(fingerprints[task._metadata["partition_index"]], 0))
 
     def _make_page_task(self, batch: list[str], task_idx: int) -> FileGroupTask:
         chunks = {entry["file_name"]: entry["_page_chunk"] for entry in map(json.loads, batch)}

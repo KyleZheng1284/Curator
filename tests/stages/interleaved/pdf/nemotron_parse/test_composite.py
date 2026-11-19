@@ -14,11 +14,15 @@
 
 """Validate opt-in served reader configuration."""
 
+from pathlib import Path
+
 import pytest
 
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.composite import NemotronParsePDFReader
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import DEFAULT_MODEL_PATH
-from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import page_task_fingerprint
+from nemo_curator.tasks import EmptyTask
+from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG, partition
 
 
 def test_served_options_do_not_rebind_existing_positional_endpoint():
@@ -182,3 +186,21 @@ def test_page_budget_does_not_rebind_legacy_positional_reader_arguments():
     assert reader.max_pdfs == reader._partitioner.max_pdfs == 17
     assert reader.pdfs_per_task == 8
     assert reader.pages_per_task is None
+
+
+def test_reader_applies_priorities_to_served_page_task_submission(tmp_path: Path):
+    manifest, original = partition(tmp_path, [{"file_name": "a.pdf", "num_pages": 3}], size=2)
+    reader = NemotronParsePDFReader(
+        manifest_path=str(manifest),
+        parse_mode="single",
+        pages_per_task=2,
+        page_task_priorities={page_task_fingerprint(original[1]): 4.0},
+        page_budget_extraction_config=TEST_EXTRACTION_CONFIG,
+        inference_server_endpoint="http://unused/v1",
+    )
+    partitioner = reader.decompose()[0]
+    ranked = partitioner.process(EmptyTask())
+
+    assert [task._metadata["partition_index"] for task in ranked] == [1, 0]
+    assert [task.data for task in ranked] == [original[1].data, original[0].data]
+    assert all(task._metadata["pdf_extraction_config"] == TEST_EXTRACTION_CONFIG for task in ranked)
