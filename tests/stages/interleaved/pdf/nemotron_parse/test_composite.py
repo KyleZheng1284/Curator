@@ -16,8 +16,10 @@
 
 import pytest
 
+from nemo_curator.stages.interleaved.pdf.nemotron_parse._early_admission import EarlyAdmissionStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.composite import NemotronParsePDFReader
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import DEFAULT_MODEL_PATH
+from nemo_curator.stages.resources import Resources
 from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG
 
 
@@ -182,3 +184,51 @@ def test_page_budget_does_not_rebind_legacy_positional_reader_arguments():
     assert reader.max_pdfs == reader._partitioner.max_pdfs == 17
     assert reader.pdfs_per_task == 8
     assert reader.pages_per_task is None
+
+
+def test_overlap_keeps_page_tasking_and_inference_worker_settings() -> None:
+    config = {
+        **TEST_EXTRACTION_CONFIG,
+        "render": {**TEST_EXTRACTION_CONFIG["render"], "raster_max_size": [1024, 1024]},
+    }
+    reader = NemotronParsePDFReader(
+        manifest_path="input.jsonl",
+        parse_mode="single",
+        inference_server_endpoint="http://unused/v1",
+        pages_per_task=64,
+        page_budget_extraction_config=config,
+        raster_max_size=(1024, 1024),
+        persistent_rendering=True,
+        overlap_rendering=True,
+    )
+    reader.with_(
+        {
+            reader._preprocessor.name: {"resources": Resources(cpus=3.0)},
+            reader._inference.name: {"num_workers": 5, "batch_size": 2, "resources": Resources(cpus=2.0)},
+        }
+    )
+
+    partitioner, overlap, postprocess, merge = reader.decompose_and_apply_with()
+
+    assert partitioner is reader._partitioner
+    assert postprocess is reader._postprocessor
+    assert merge is reader._merger
+    assert isinstance(overlap, EarlyAdmissionStage)
+    assert overlap.ray_stage_spec()["is_actor_stage"]
+    assert overlap.num_workers() == 5
+    assert overlap.batch_size == 2
+    assert overlap.resources.cpus == 5
+    assert overlap.renderer.raster_max_size == (1024, 1024)
+    assert overlap.renderer.persistent_rendering
+
+
+def test_custom_raster_cap_requires_matching_extraction_identity() -> None:
+    with pytest.raises(ValueError, match="does not match rendering settings"):
+        NemotronParsePDFReader(
+            manifest_path="input.jsonl",
+            parse_mode="single",
+            inference_server_endpoint="http://unused/v1",
+            pages_per_task=64,
+            page_budget_extraction_config=TEST_EXTRACTION_CONFIG,
+            raster_max_size=(1024, 1024),
+        )
