@@ -23,7 +23,7 @@ import os
 import queue
 import time
 from dataclasses import dataclass, field
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import pyarrow as pa
@@ -32,6 +32,12 @@ from PIL import Image
 
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse._image_transport import PNG_METADATA_KEY, png_batch_provenance
+from nemo_curator.stages.interleaved.pdf.nemotron_parse._pdf_renderer import (
+    DEFAULT_RASTER_MAX_SIZE,
+    PersistentPdfRenderer,
+    RenderWorkerUnavailableError,
+    check_cancel,
+)
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
     ExtractionConfigMismatchError,
     output_version,
@@ -45,6 +51,10 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.utils import (
 )
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import FileGroupTask, InterleavedBatch
+
+if TYPE_CHECKING:
+    import threading
+    from collections.abc import Callable
 
 
 @dataclass
@@ -85,6 +95,10 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         Preserve physical page indexes and failed-page rows for the served parser.
     reuse_encoded_images
         Attach private ordered-batch provenance for optional verified PNG reuse.
+    raster_max_size
+        Maximum fitted raster width and height in pixels.
+    persistent_rendering
+        Reuse an isolated PDFium subprocess across render ranges on POSIX.
     """
 
     zip_base_dir: str | None = None
@@ -94,9 +108,12 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
     max_pages: int = 50
     retain_failures: bool = field(default=False, kw_only=True)
     reuse_encoded_images: bool = field(default=False, kw_only=True)
+    raster_max_size: tuple[int, int] = field(default=DEFAULT_RASTER_MAX_SIZE, kw_only=True)
+    persistent_rendering: bool = field(default=False, kw_only=True)
     name: str = "pdf_preprocess"
     resources: Resources = field(default_factory=lambda: Resources(cpus=2.0))
     _extraction_config: dict[str, Any] | None = field(default=None, init=False, repr=False)
+    _persistent_renderer: PersistentPdfRenderer | None = field(default=None, init=False, repr=False, compare=False)
 
     def _check_extraction_settings(self) -> None:
         if self._extraction_config is None:
@@ -109,6 +126,8 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             "retry_timeout_s": self._RENDER_RETRY_TIMEOUT_S,
             "max_attempts": self._RENDER_MAX_ATTEMPTS,
         }
+        if self.raster_max_size != DEFAULT_RASTER_MAX_SIZE:
+            effective["raster_max_size"] = list(self.raster_max_size)
         if self._extraction_config["render"] != effective:
             msg = "Effective rendering/recovery settings differ from admitted extraction configuration"
             raise ExtractionConfigMismatchError(msg)
@@ -117,6 +136,27 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         if type(self.reuse_encoded_images) is not bool:
             msg = "reuse_encoded_images must be a boolean"
             raise TypeError(msg)
+        if type(self.persistent_rendering) is not bool:
+            msg = "persistent_rendering must be a boolean"
+            raise TypeError(msg)
+        if (
+            not isinstance(self.raster_max_size, tuple)
+            or len(self.raster_max_size) != len(DEFAULT_RASTER_MAX_SIZE)
+            or any(type(size) is not int or size <= 0 for size in self.raster_max_size)
+        ):
+            msg = "raster_max_size must be a pair of positive integer dimensions"
+            raise ValueError(msg)
+
+    def ray_stage_spec(self) -> dict[str, Any]:
+        spec = super().ray_stage_spec()
+        if self.persistent_rendering:
+            spec["is_actor_stage"] = True
+        return spec
+
+    def teardown(self) -> None:
+        if self._persistent_renderer is not None:
+            self._persistent_renderer.close()
+            self._persistent_renderer = None
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -186,15 +226,57 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
     _RENDER_RETRY_TIMEOUT_S: ClassVar[float] = 60
     _RENDER_MAX_ATTEMPTS: ClassVar[int] = 7
 
-    def _render_once(  # noqa: C901, PLR0915
+    def _render_once(
         self,
         pdf_bytes: bytes,
         page_indices: list[int] | None,
         *,
         timeout_s: float | None = None,
         expected_page_count: int | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> tuple[list[Image.Image | None], bool, int | None]:
+        check_cancel(cancel_event)
+        timeout_s = self._RENDER_TIMEOUT_S if timeout_s is None else timeout_s
+        deadline = time.monotonic() + timeout_s
+        if self.persistent_rendering and os.name == "posix":
+            if self._persistent_renderer is None:
+                self._persistent_renderer = PersistentPdfRenderer()
+            options = (
+                self.dpi,
+                self.max_pages,
+                self.raster_max_size,
+                self.retain_failures or page_indices is not None,
+                page_indices,
+                page_indices is None or expected_page_count is not None,
+            )
+            try:
+                return self._persistent_renderer.render(pdf_bytes, options, deadline, cancel_event)
+            except RenderWorkerUnavailableError as error:
+                logger.debug("Rendering PDF range in a fresh child: {}", error)
+                # Forking the fallback must not keep the persistent worker's
+                # owner-liveness pipe open.
+                self._persistent_renderer.close()
+        return self._render_once_fresh(
+            pdf_bytes,
+            page_indices,
+            deadline=deadline,
+            expected_page_count=expected_page_count,
+            cancel_event=cancel_event,
+        )
+
+    def _render_once_fresh(  # noqa: C901, PLR0912, PLR0915
+        self,
+        pdf_bytes: bytes,
+        page_indices: list[int] | None,
+        *,
+        deadline: float,
+        expected_page_count: int | None,
+        cancel_event: threading.Event | None,
     ) -> tuple[list[Image.Image | None], bool, int | None]:
         """Render one window, always closing queues and reaping its child."""
+        check_cancel(cancel_event)
+        if time.monotonic() >= deadline:
+            return [], True, None
         ctx = multiprocessing.get_context("fork")
         result_q: multiprocessing.Queue = ctx.Queue()
         page_count_q: multiprocessing.Queue = ctx.Queue()
@@ -214,6 +296,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                         pdf_bytes,
                         dpi=self.dpi,
                         max_pages=self.max_pages,
+                        max_size=self.raster_max_size,
                         keep_failed=self.retain_failures or page_indices is not None,
                         page_indices=page_indices,
                     )
@@ -227,9 +310,9 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         page_count = None
         try:
             proc.start()
-            deadline = time.monotonic() + (self._RENDER_TIMEOUT_S if timeout_s is None else timeout_s)
             # Read before joining: a large result can fill the pipe and block the child feeder.
             while (remaining := deadline - time.monotonic()) > 0:
+                check_cancel(cancel_event)
                 try:
                     pages = result_q.get(timeout=min(0.1, remaining))
                     break
@@ -275,6 +358,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         page_indices: list[int] | None = None,
         *,
         expected_page_count: int | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> list[Image.Image | None]:
         """Recover served-parser windows within one shared time and attempt budget.
 
@@ -283,15 +367,12 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         timeout behavior. The initial timeout can be overridden on a run's stage
         instance without increasing either the retry timeout or recovery budget.
         """
-        if expected_page_count is None:
-            pages, timed_out, page_count = self._render_once(pdf_bytes, page_indices)
-        else:
-            pages, timed_out, page_count = self._render_once(
-                pdf_bytes, page_indices, expected_page_count=expected_page_count
-            )
-            if page_count is not None and page_count != expected_page_count:
-                msg = f"Stale num_pages for {file_name}: manifest={expected_page_count}, actual={page_count}"
-                raise ValueError(msg)
+        cancel_kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
+        count_kwargs = {"expected_page_count": expected_page_count} if expected_page_count is not None else {}
+        pages, timed_out, page_count = self._render_once(pdf_bytes, page_indices, **count_kwargs, **cancel_kwargs)
+        if expected_page_count is not None and page_count is not None and page_count != expected_page_count:
+            msg = f"Stale num_pages for {file_name}: manifest={expected_page_count}, actual={page_count}"
+            raise ValueError(msg)
         if not self.retain_failures:
             return [] if timed_out else pages
         requested = page_indices
@@ -311,12 +392,13 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
 
         def recover(indexes: list[int]) -> list[Image.Image | None]:
             nonlocal attempts
+            check_cancel(cancel_event)
             remaining = deadline - time.monotonic()
             if remaining <= 0 or attempts >= self._RENDER_MAX_ATTEMPTS:
                 return [None] * len(indexes)
             attempts += 1
             result, timeout, _ = self._render_once(
-                pdf_bytes, indexes, timeout_s=min(self._RENDER_RETRY_TIMEOUT_S, remaining)
+                pdf_bytes, indexes, timeout_s=min(self._RENDER_RETRY_TIMEOUT_S, remaining), **cancel_kwargs
             )
             if not timeout and self._valid_render_result(result, len(indexes)):
                 return result
@@ -368,7 +450,18 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             error = json.dumps({"stage": "render_pdf", "type": "RenderError", "message": "Page rendering failed"})
         return {**row, "page_number": page_num, "materialize_error": error}
 
-    def process(self, task: FileGroupTask) -> InterleavedBatch | None:  # noqa: C901, PLR0912, PLR0915
+    def process(self, task: FileGroupTask) -> InterleavedBatch | None:
+        return self._process(task)
+
+    def _process(  # noqa: C901, PLR0912, PLR0915
+        self,
+        task: FileGroupTask,
+        *,
+        range_sink: Callable[[list[dict[str, Any]]], None] | None = None,
+        cancel_event: threading.Event | None = None,
+    ) -> InterleavedBatch | None:
+        """Optionally deliver each finished range and keep only its row metadata."""
+        check_cancel(cancel_event)
         self._check_extraction_settings()
         if self._extraction_config is not None and output_version(task._metadata) != output_version(
             {"pdf_extraction_config": self._extraction_config}
@@ -376,6 +469,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             msg = "Page task does not match this renderer's admitted extraction identity"
             raise ExtractionConfigMismatchError(msg)
         rows: list[dict[str, Any]] = []
+        cancel_kwargs = {"cancel_event": cancel_event} if cancel_event is not None else {}
 
         parsed: list[dict] = [json.loads(e) for e in task.data]
         if task._metadata.get("pdf_page_chunks") and not self.retain_failures:
@@ -396,6 +490,14 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 ]
             return [failed]
 
+        def emit_rows(range_rows: list[dict[str, Any]]) -> None:
+            check_cancel(cancel_event)
+            if range_sink is None:
+                rows.extend(range_rows)
+            elif range_rows:
+                rows.extend({**row, "binary_content": None} for row in range_rows)
+                range_sink(range_rows)
+
         # Pre-fetch all JSONL PDFs in batch (one file open per source JSONL)
         jsonl_bytes: dict[int, bytes | None] | None = None
         if self.jsonl_base_dir is not None:
@@ -405,6 +507,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 metrics["pdf_read_s"] += time.perf_counter() - started
 
         for idx, entry in enumerate(parsed):
+            check_cancel(cancel_event)
             file_name = entry["file_name"]
             url = entry.get("url", "")
             sample_id = file_name.rsplit(".", 1)[0]
@@ -419,7 +522,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 metrics["pdf_source_bytes"] += len(pdf_bytes) if pdf_bytes is not None else 0
             if pdf_bytes is None:
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "read_pdf", "Could not read PDF"))
+                    emit_rows(failed_rows(entry, sample_id, url, "read_pdf", "Could not read PDF"))
                 logger.warning(f"Could not read PDF: {file_name}")
                 continue
 
@@ -432,22 +535,26 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             ):
                 msg = "selected_page_indices must be a nonempty list of unique nonnegative integers"
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "manifest", msg))
+                    emit_rows(failed_rows(entry, sample_id, url, "manifest", msg))
                 logger.warning(f"Invalid selected_page_indices for {file_name}: {page_indices!r}")
                 continue
 
             started = time.perf_counter() if metrics is not None else None
             if entry.get("_page_chunk") and entry.get("num_pages") is not None:
                 page_images = self._render_with_timeout(
-                    pdf_bytes, file_name, page_indices, expected_page_count=entry["num_pages"]
+                    pdf_bytes,
+                    file_name,
+                    page_indices,
+                    expected_page_count=entry["num_pages"],
+                    **cancel_kwargs,
                 )
             else:
-                page_images = self._render_with_timeout(pdf_bytes, file_name, page_indices)
+                page_images = self._render_with_timeout(pdf_bytes, file_name, page_indices, **cancel_kwargs)
             if metrics is not None:
                 metrics["pdf_render_s"] += time.perf_counter() - started
             if not page_images:
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "render_pdf", "No render result"))
+                    emit_rows(failed_rows(entry, sample_id, url, "render_pdf", "No render result"))
                 logger.warning(f"No pages rendered from {file_name}; skipping")
                 continue
 
@@ -459,9 +566,9 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 if self.retain_failures or page_img is not None
             )
             if chunk := entry.get("_page_chunk"):
-                rows.extend({**row, "document_id": chunk["document_id"]} for row in page_rows)
+                emit_rows([{**row, "document_id": chunk["document_id"]} for row in page_rows])
             else:
-                rows.extend(page_rows)
+                emit_rows(list(page_rows))
 
         if not rows:
             return None
@@ -475,7 +582,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         metadata = {key: value for key, value in task._metadata.items() if key != PNG_METADATA_KEY}
         metadata = (
             {**metadata, PNG_METADATA_KEY: png_batch_provenance(row["binary_content"] for row in rows)}
-            if self.reuse_encoded_images
+            if self.reuse_encoded_images and range_sink is None
             else metadata
         )
         return InterleavedBatch(

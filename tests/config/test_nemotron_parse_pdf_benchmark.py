@@ -123,13 +123,15 @@ def test_external_topology_is_explicit_and_validated_without_local_gpu_discovery
 
 
 @pytest.mark.parametrize("client_gpus", [0, 8])
+@pytest.mark.parametrize("overlap_rendering", [False, True])
 def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
-    benchmark: tuple, monkeypatch: pytest.MonkeyPatch, client_gpus: int
+    benchmark: tuple, monkeypatch: pytest.MonkeyPatch, client_gpus: int, overlap_rendering: bool
 ):
     module, args, pipeline, build, _, factory, probe = benchmark
     args.inference_server_endpoint = "http://remote/v1"
     args.num_replicas = 2
     args.inference_server_num_gpus = 1
+    args.overlap_rendering = overlap_rendering
     probe.return_value = client_gpus
     pipeline.run.return_value = [Mock()]
     monkeypatch.setattr(module, "_count_unique_pdfs", lambda _tasks: 1)
@@ -147,7 +149,11 @@ def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
     assert result["params"]["num_replicas"] == 2
     assert result["params"]["num_inference_gpus"] == 1
     assert build.call_args.kwargs["inference_server_client_num_workers"] == 8
-    assert result["metrics"]["inference_stage_pages_per_sec_per_gpu"] == 5.0
+    inference_rate = "inference_stage_pages_per_sec_per_gpu"
+    if overlap_rendering:
+        assert inference_rate not in result["metrics"]
+    else:
+        assert result["metrics"][inference_rate] == 5.0
     assert result["metrics"]["throughput_pages_per_sec_per_gpu"] == result["metrics"]["throughput_pages_per_sec"]
     factory.assert_not_called()
     probe.assert_not_called()

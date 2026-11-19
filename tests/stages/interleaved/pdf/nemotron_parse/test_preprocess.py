@@ -16,6 +16,7 @@
 
 import io
 import json
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -31,6 +32,7 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse._image_transport import 
     has_png_batch_provenance,
     png_batch_provenance,
 )
+from nemo_curator.stages.interleaved.pdf.nemotron_parse._pdf_renderer import RenderCancelledError
 from nemo_curator.tasks import FileGroupTask
 from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import partition
 
@@ -390,3 +392,45 @@ def test_real_pdf_page_budget_preserves_full_document_and_render_hashes(tmp_path
     assert [hashlib.sha256(row["binary_content"]).hexdigest() for row in split_rows] == [
         hashlib.sha256(row["binary_content"]).hexdigest() for row in whole_rows
     ]
+
+
+def test_streamed_ranges_preserve_failures_and_deliver_payloads_before_parent_completion(tmp_path: Path) -> None:
+    (tmp_path / "three.pdf").write_bytes(pdf_bytes())
+    stage = preprocess.PDFPreprocessStage(
+        pdf_dir=str(tmp_path), retain_failures=True, reuse_encoded_images=True, raster_max_size=(110, 110)
+    )
+    entries = [
+        json.dumps({"file_name": "three.pdf", "selected_page_indices": [2, 0]}),
+        json.dumps({"file_name": "missing.pdf"}),
+    ]
+    task = FileGroupTask(dataset_name="test", data=entries)
+    delivered = []
+    rendered = stage._process(task, range_sink=delivered.append)
+    assert [[row["page_number"] for row in batch] for batch in delivered] == [[2, 0], [None]]
+    assert json.loads(delivered[1][0]["materialize_error"])["stage"] == "read_pdf"
+    assert all(row["binary_content"] for row in delivered[0])
+    for row in delivered[0]:
+        with Image.open(io.BytesIO(row["binary_content"])) as image:
+            assert image.width == 110
+            assert image.height <= 110
+    stubs = rendered.to_pyarrow().to_pylist()
+    assert stubs == [{**row, "binary_content": None} for batch in delivered for row in batch]
+    assert PNG_METADATA_KEY not in rendered._metadata
+
+
+def test_cancel_after_first_range_does_not_deliver_sibling_ranges(tmp_path: Path) -> None:
+    (tmp_path / "three.pdf").write_bytes(pdf_bytes())
+    stage = preprocess.PDFPreprocessStage(pdf_dir=str(tmp_path), retain_failures=True)
+    task = FileGroupTask(
+        dataset_name="test", data=[json.dumps({"file_name": name}) for name in ("three.pdf", "missing.pdf")]
+    )
+    cancel_event = threading.Event()
+    batches = []
+
+    def cancel_after_delivery(batch: list[dict]) -> None:
+        batches.append(batch)
+        cancel_event.set()
+
+    with pytest.raises(RenderCancelledError, match="cancelled"):
+        stage._process(task, range_sink=cancel_after_delivery, cancel_event=cancel_event)
+    assert [row["page_number"] for batch in batches for row in batch] == [0, 1, 2]

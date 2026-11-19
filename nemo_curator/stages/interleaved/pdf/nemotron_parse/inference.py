@@ -28,7 +28,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pyarrow as pa
 import torch
@@ -49,6 +49,10 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
 from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import InterleavedBatch
 
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Awaitable, Callable
+
+
 DEFAULT_MODEL_PATH = "nvidia/NVIDIA-Nemotron-Parse-v1.2"
 PROMPT_BASE = "</s><s><predict_bbox><predict_classes><output_markdown>"
 DEFAULT_MAX_TOKENS = 8192
@@ -66,6 +70,15 @@ _NEMOTRON_PARSE_SAMPLING_PARAMS: dict[str, Any] = {
     "seed": None,
 }
 _OPENAI_GENERATION_CONFIG_FIELDS = {"max_tokens", "seed", "temperature", "top_p"}
+
+
+@dataclass
+class _ActiveParseRequests:
+    tasks: set[asyncio.Task] = field(default_factory=set)
+    closed: bool = False
+
+
+_PARSE_ACTIVE_REQUESTS: ContextVar[_ActiveParseRequests | None] = ContextVar("active_parse_requests", default=None)
 _PARSE_TRANSPORT: ContextVar[tuple[AsyncOpenAIClient, asyncio.AbstractEventLoop]] = ContextVar("parse_transport")
 _PARSE_REQUESTS: ContextVar[list[dict[str, Any]]] = ContextVar("parse_requests")
 _PARSE_ENCODED_IMAGE: ContextVar[tuple[bytes, tuple[int, int], bytes] | None] = ContextVar(
@@ -630,6 +643,13 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     ) -> _HTTPPageResult:
         record: dict[str, Any] = {"stage": stage}
         requests.append(record)
+        active = _PARSE_ACTIVE_REQUESTS.get()
+        task = asyncio.current_task()
+        if active is not None:
+            if active.closed:
+                raise asyncio.CancelledError
+            if task is not None:
+                active.tasks.add(task)
         try:
             response = await self._query_page(
                 client, image_bytes, "image/png", prompt=prompt, generation_config=generation
@@ -637,6 +657,9 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         except Exception as exc:
             record["error"] = type(exc).__name__
             raise
+        finally:
+            if active is not None and task is not None:
+                active.tasks.discard(task)
         record.update(
             raw_out=response.text,
             finish_reason=response.finish_reason,
@@ -648,6 +671,14 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     async def _parse_pages(
         self, pages: list[dict[str, Any]], *, reuse_encoded_images: bool = False
     ) -> list[dict[str, Any]]:
+        async with self._page_parser() as parse_page:
+            return list(await asyncio.gather(*(parse_page(row, reuse_encoded_images) for row in pages)))
+
+    @contextlib.asynccontextmanager
+    async def _page_parser(
+        self, *, settle_on_cancel: bool = False
+    ) -> AsyncIterator[Callable[[dict[str, Any], bool], Awaitable[dict[str, Any]]]]:
+        """Share the same HTTP client and bounded parser pool across an entire parent."""
         client = AsyncOpenAIClient(
             max_concurrent_requests=self.inference_batch_size,
             max_retries=self.max_retries,
@@ -662,72 +693,87 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         token = _PARSE_TRANSPORT.set((client, loop))
         semaphore = asyncio.Semaphore(self.inference_batch_size)
 
-        async def parse_page(row: dict[str, Any]) -> dict[str, Any]:
+        active = _ActiveParseRequests() if settle_on_cancel else None
+        request_token = _PARSE_ACTIVE_REQUESTS.set(active)
+
+        async def parse_page(row: dict[str, Any], reuse_encoded_images: bool) -> dict[str, Any]:
             if row.get("materialize_error"):
                 return {**row, "parse_document": None}
-            requests: list[dict[str, Any]] = []
-            request_token = _PARSE_REQUESTS.set(requests)
-            image_metrics: dict[str, int] = {}
-            image_token = _PARSE_IMAGE_METRICS.set(image_metrics)
-            document = None
-            try:
-                async with semaphore:
-                    image_args = (row["binary_content"], True) if reuse_encoded_images else (row["binary_content"],)
-                    document = await loop.run_in_executor(
-                        parser_pool, copy_context().run, self._parse_image, *image_args
-                    )
-                if not isinstance(document, dict) or not document.get("blocks"):
-                    error = {
-                        "stage": "parse_output",
-                        "type": "NoDecodedBlocks",
-                        "message": "Model response produced no decoded blocks",
-                        "raw_response": document,
-                        "requests": requests,
-                    }
-                    result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
-                else:
-                    result = {**row, "parse_document": json.dumps(document), "materialize_error": None}
-            except Exception as exc:
-                if isinstance(exc, ExtractionConfigMismatchError):
-                    raise
-                error = {
-                    "stage": getattr(exc, "stage", "parse_request"),
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                if (response := getattr(exc, "response", None)) is not None:
-                    error["raw_response"] = (
-                        response
-                        if isinstance(response, dict)
-                        else {
-                            "status_code": getattr(response, "status_code", None),
-                            "body": getattr(exc, "body", None),
-                        }
-                    )
-                if requests:
-                    error["requests"] = requests
-                result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
-            finally:
-                _PARSE_REQUESTS.reset(request_token)
-                _PARSE_IMAGE_METRICS.reset(image_token)
-            result["_parse_metrics"] = {
-                "num_requests": len(requests),
-                "num_failed_requests": sum("error" in request for request in requests),
-                "total_prompt_tokens": sum(request.get("prompt_tokens", 0) for request in requests),
-                "total_output_tokens": sum(request.get("completion_tokens", 0) for request in requests),
-                **image_metrics,
-            }
-            return result
+            async with semaphore:
+                return await loop.run_in_executor(
+                    parser_pool, copy_context().run, self._parse_page, row, reuse_encoded_images
+                )
 
         try:
-            return list(await asyncio.gather(*(parse_page(row) for row in pages)))
+            yield parse_page
         finally:
-            # Do not wait: after a cancellation, parser threads may still be waiting on this loop.
-            parser_pool.shutdown(wait=False, cancel_futures=True)
+            if active is not None:
+                # Parser threads can submit work while their wrapper tasks get
+                # cancelled. Close that admission path before waiting for them.
+                active.closed = True
+                for task in active.tasks:
+                    task.cancel()
+                await asyncio.gather(*active.tasks, return_exceptions=True)
+                await asyncio.to_thread(parser_pool.shutdown, wait=True, cancel_futures=True)
+            else:
+                parser_pool.shutdown(wait=False, cancel_futures=True)
+            _PARSE_ACTIVE_REQUESTS.reset(request_token)
             _PARSE_TRANSPORT.reset(token)
             if hasattr(client, "client"):
                 with contextlib.suppress(Exception):
                     await client.client.close()
+
+    def _parse_page(self, row: dict[str, Any], reuse_encoded_images: bool) -> dict[str, Any]:
+        requests: list[dict[str, Any]] = []
+        request_token = _PARSE_REQUESTS.set(requests)
+        image_metrics: dict[str, int] = {}
+        image_token = _PARSE_IMAGE_METRICS.set(image_metrics)
+        document = None
+        try:
+            image_args = (row["binary_content"], True) if reuse_encoded_images else (row["binary_content"],)
+            document = self._parse_image(*image_args)
+            if not isinstance(document, dict) or not document.get("blocks"):
+                error = {
+                    "stage": "parse_output",
+                    "type": "NoDecodedBlocks",
+                    "message": "Model response produced no decoded blocks",
+                    "raw_response": document,
+                    "requests": requests,
+                }
+                result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
+            else:
+                result = {**row, "parse_document": json.dumps(document), "materialize_error": None}
+        except Exception as exc:
+            if isinstance(exc, ExtractionConfigMismatchError):
+                raise
+            error = {
+                "stage": getattr(exc, "stage", "parse_request"),
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            if (response := getattr(exc, "response", None)) is not None:
+                error["raw_response"] = (
+                    response
+                    if isinstance(response, dict)
+                    else {
+                        "status_code": getattr(response, "status_code", None),
+                        "body": getattr(exc, "body", None),
+                    }
+                )
+            if requests:
+                error["requests"] = requests
+            result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
+        finally:
+            _PARSE_REQUESTS.reset(request_token)
+            _PARSE_IMAGE_METRICS.reset(image_token)
+        result["_parse_metrics"] = {
+            "num_requests": len(requests),
+            "num_failed_requests": sum("error" in request for request in requests),
+            "total_prompt_tokens": sum(request.get("prompt_tokens", 0) for request in requests),
+            "total_output_tokens": sum(request.get("completion_tokens", 0) for request in requests),
+            **image_metrics,
+        }
+        return result
 
     def _parse_image(self, image_bytes: bytes, reuse_encoded_image: bool = False) -> dict[str, Any]:
         with io.BytesIO(image_bytes) as stream, Image.open(stream) as image:
@@ -748,16 +794,19 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             finally:
                 _PARSE_ENCODED_IMAGE.reset(token)
 
-    def _process_parse(self, task: InterleavedBatch) -> InterleavedBatch:
+    def _check_parse_task(self, metadata: dict[str, Any]) -> None:
         if getattr(self, "_parser", None) is None:
             msg = "Call setup() before processing served Parse 3.5 pages"
             raise RuntimeError(msg)
-        if "pdf_page_chunks" in task._metadata and (
+        if "pdf_page_chunks" in metadata and (
             self.extraction_config is None
-            or output_version(task._metadata) != output_version({"pdf_extraction_config": self.extraction_config})
+            or output_version(metadata) != output_version({"pdf_extraction_config": self.extraction_config})
         ):
             msg = "Page task does not match this worker's admitted extraction identity"
             raise ExtractionConfigMismatchError(msg)
+
+    def _process_parse(self, task: InterleavedBatch) -> InterleavedBatch:
+        self._check_parse_task(task._metadata)
         started = time.perf_counter()
         table = task.to_pyarrow()
         if "page_number" not in table.column_names:
@@ -768,8 +817,14 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             task._metadata, (row.get("binary_content") for row in pages)
         )
         rows = asyncio.run(self._parse_pages(pages, reuse_encoded_images=reuse_encoded_images))
+        return self._finish_parse_task(task, rows, started)
+
+    def _finish_parse_task(
+        self, task: InterleavedBatch, rows: list[dict[str, Any]], started: float, *, includes_rendering: bool = False
+    ) -> InterleavedBatch:
+        time_metric = "render_parse_time" if includes_rendering else "inference_server_request_time"
         metrics = {
-            "inference_server_request_time": time.perf_counter() - started,
+            time_metric: time.perf_counter() - started,
             "num_input_pages": float(sum(row.get("page_number") is not None for row in rows)),
             "num_error_pages": float(
                 sum(row.get("page_number") is not None and bool(row.get("materialize_error")) for row in rows)

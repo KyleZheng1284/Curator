@@ -25,6 +25,7 @@ from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse import NemotronParsePDFReader
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import DEFAULT_MAX_TOKENS
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import output_version, validate_extraction_config
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.preprocess import DEFAULT_RASTER_MAX_SIZE
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.schema import PAGE_OUTPUT_SCHEMA
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.validation import PDFPageBudgetValidationStage
 from nemo_curator.utils.operation_utils import make_named_temporary_file
@@ -78,6 +79,24 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         help="Resolved served extraction JSON required with --pages-per-task; records identities, not tuning overrides",
     )
     parser.add_argument("--dpi", type=int, default=300, help="PDF rendering resolution")
+    parser.add_argument(
+        "--raster-max-size",
+        type=int,
+        nargs=2,
+        metavar=("WIDTH", "HEIGHT"),
+        default=DEFAULT_RASTER_MAX_SIZE,
+        help="Cap the rendered page dimensions in pixels while preserving its aspect ratio",
+    )
+    parser.add_argument(
+        "--persistent-rendering",
+        action="store_true",
+        help="Reuse an isolated PDFium process across render ranges",
+    )
+    parser.add_argument(
+        "--overlap-rendering",
+        action="store_true",
+        help="Submit completed render ranges while rendering continues in served page mode (up to 64 pages per task)",
+    )
     parser.add_argument(
         "--max-pages",
         type=int,
@@ -177,6 +196,9 @@ def create_nemotron_parse_pdf_pipeline(
             page_budget_extraction_config=extraction_config,
             max_pdfs=args.max_pdfs,
             dpi=args.dpi,
+            raster_max_size=tuple(getattr(args, "raster_max_size", DEFAULT_RASTER_MAX_SIZE)),
+            persistent_rendering=getattr(args, "persistent_rendering", False),
+            overlap_rendering=getattr(args, "overlap_rendering", False),
             max_pages=args.max_pages,
             inference_batch_size=args.inference_batch_size,
             max_num_seqs=args.max_num_seqs,
