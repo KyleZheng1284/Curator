@@ -14,6 +14,7 @@ from typing import Any, ClassVar
 import pyarrow as pa
 import pyarrow.compute as pc
 
+from nemo_curator import _parse35_stage_trace as trace
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import identity_digest
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.schema import PAGE_OUTPUT_SCHEMA, align_page_output
@@ -99,6 +100,7 @@ class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
             return []
         ordered = sorted(tasks, key=lambda task: task._metadata["pdf_chunk"]["offset"])
         first = ordered[0]._metadata["pdf_chunk"]
+        trace.emit("document_merge_begin", document_id=first["document_id"], chunks=len(ordered))
         offset, content, outcomes = 0, [], []
         position = 0
         metadata_row, document_info = None, None
@@ -154,6 +156,7 @@ class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         validate_document_rows(merged.drop(["binary_content"]).to_pylist())
         output_id = identity_digest([first["document_id"], first["selection_sha256"], document_info["pdf_provenance"]])
         self._log_metrics({"merged_chunks": float(len(ordered)), "merged_pages": float(offset)})
+        trace.emit("document_merged", document_id=first["document_id"], physical_pages=indexes, output_file_id=output_id)
         return [
             InterleavedBatch(
                 dataset_name=ordered[0].dataset_name,

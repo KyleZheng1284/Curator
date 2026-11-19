@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 from nemo_curator.stages.base import CompositeStage, ProcessingStage
@@ -252,3 +253,12 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     def decompose(self) -> list[ProcessingStage]:
         stages = [self._partitioner, self._preprocessor, self._inference, self._postprocessor]
         return stages if self._merger is None else [*stages, self._merger]
+
+    def decompose_and_apply_with(self) -> list[ProcessingStage]:
+        # Existing stage-name overrides must resolve before the opt-in render /
+        # HTTP fusion hides those two ordinary names from the planner.
+        stages = self._apply_with_(self.decompose())
+        if os.environ.get("PARSE35_EARLY_ADMISSION") == "1":
+            from experiments.local_parse.early_admission import configure
+            return configure(self, stages=stages).decompose()
+        return stages

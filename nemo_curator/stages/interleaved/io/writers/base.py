@@ -26,6 +26,7 @@ from fsspec.core import url_to_fs
 from fsspec.implementations.local import LocalFileSystem
 from loguru import logger
 
+from nemo_curator import _parse35_stage_trace as trace
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.utils import materialize_task_binary_content
 from nemo_curator.stages.interleaved.utils.schema import align_table, reconcile_schema, resolve_schema
@@ -187,6 +188,10 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
         file_path = self.fs.sep.join([self._fs_path, f"{filename}.{self.file_extension}"])
         file_path_with_protocol = self.fs.unstrip_protocol(file_path) if is_remote_url(self.path) else file_path
 
+        document_id = task._metadata.get("pdf_document_id")
+        output_id = task._metadata.get("output_file_id")
+        if document_id is not None:
+            trace.emit("document_publish_begin", document_id=document_id, output_file_id=output_id)
         if self.atomic_local_write:
             self.fs.makedirs(self._fs_path, exist_ok=True)
             temporary_path = self.fs.sep.join(
@@ -198,6 +203,8 @@ class BaseInterleavedWriter(ProcessingStage[InterleavedBatch, FileGroupTask], AB
             os.replace(temporary_path, file_path)
         else:
             self.write_data(task, file_path_with_protocol)
+        if document_id is not None:
+            trace.emit("document_published", document_id=document_id, output_file_id=output_id)
         return FileGroupTask(
             dataset_name=task.dataset_name,
             data=[file_path_with_protocol],

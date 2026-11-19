@@ -25,6 +25,7 @@ import pandas as pd
 import pyarrow as pa
 from PIL import Image
 
+from nemo_curator import _parse35_stage_trace as trace
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import output_version, validate_chunk_pages
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.schema import align_page_output
@@ -147,6 +148,8 @@ class NemotronParsePostprocessStage(ProcessingStage[InterleavedBatch, Interleave
                 page = by_page[index]
                 projected = self._page_rows(page)
                 content.extend({**row, "document_id": chunk["document_id"]} for row in projected)
+                trace.emit("page_postprocess_done", **trace.page_fields(page),
+                           status="failed" if page.get("materialize_error") else "success", rows=len(projected))
                 outcomes.append(
                     {
                         "page_number": index,

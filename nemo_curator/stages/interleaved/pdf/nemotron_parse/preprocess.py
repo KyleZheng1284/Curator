@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -30,6 +32,7 @@ import pyarrow as pa
 from loguru import logger
 from PIL import Image
 
+from nemo_curator import _parse35_stage_trace as trace
 from nemo_curator.stages.base import ProcessingStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse._image_transport import PNG_METADATA_KEY, png_batch_provenance
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
@@ -109,6 +112,8 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             "retry_timeout_s": self._RENDER_RETRY_TIMEOUT_S,
             "max_attempts": self._RENDER_MAX_ATTEMPTS,
         }
+        if os.environ.get("CURATOR_STUDY_RASTER") == "matched":
+            effective.update(image_format="jpeg", jpeg_quality=100, raster_max_size=[1024, 1024])
         if self._extraction_config["render"] != effective:
             msg = "Effective rendering/recovery settings differ from admitted extraction configuration"
             raise ExtractionConfigMismatchError(msg)
@@ -195,6 +200,8 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
         expected_page_count: int | None = None,
     ) -> tuple[list[Image.Image | None], bool, int | None]:
         """Render one window, always closing queues and reaping its child."""
+        if os.environ.get("CURATOR_STUDY_RASTER") == "matched":
+            return self._study_render_once(pdf_bytes, page_indices, timeout_s=timeout_s)
         ctx = multiprocessing.get_context("fork")
         result_q: multiprocessing.Queue = ctx.Queue()
         page_count_q: multiprocessing.Queue = ctx.Queue()
@@ -213,6 +220,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                     render_pdf_pages(
                         pdf_bytes,
                         dpi=self.dpi,
+                        max_size=(1024, 1024) if os.environ.get("CURATOR_STUDY_RASTER") == "matched" else (1664, 2048),
                         max_pages=self.max_pages,
                         keep_failed=self.retain_failures or page_indices is not None,
                         page_indices=page_indices,
@@ -259,6 +267,54 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                     finally:
                         page_count_q.close()
         return pages, timed_out, page_count
+
+    def _study_render_once(self, pdf_bytes, page_indices, *, timeout_s=None):
+        import pickle
+        import subprocess
+        from pathlib import Path
+        study = Path(__file__).resolve().parents[6]
+        nrl = study.parent / "nrl-rtx-2865-profile-20261118"
+        environment = dict(os.environ, CUDA_VISIBLE_DEVICES="",
+                           PYTHONPATH=str(nrl / "source/nemo_retriever/src"),
+                           OMP_NUM_THREADS="1", OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
+        request = pickle.dumps({"pdf_bytes": pdf_bytes, "page_indices": page_indices,
+                                "max_pages": self.max_pages}, protocol=pickle.HIGHEST_PROTOCOL)
+        effective_timeout = self._RENDER_TIMEOUT_S if timeout_s is None else timeout_s
+        cancel = getattr(self, "_early_cancel_event", None)
+        try:
+            if os.environ.get("PARSE35_PERSISTENT_FITTED_RENDERER") == "1":
+                from experiments.local_parse.persistent_renderer import render
+                response_bytes = render(self, request, effective_timeout, cancel)
+            else:
+                command = [str(nrl / "runtime/bin/python"), "-B", "-s", str(study / "curator_render_helper.py")]
+                if cancel is None:
+                    response = subprocess.run(command, input=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                              env=environment, check=True, timeout=effective_timeout)
+                else:
+                    from experiments.local_parse.early_admission import cancellable_helper
+                    response = cancellable_helper(command, request, environment, effective_timeout, cancel)
+                response_bytes = response.stdout
+        except subprocess.TimeoutExpired:
+            return [], True, None
+        except subprocess.CalledProcessError as error:
+            raise RuntimeError("Shared raster helper failed: " + error.stderr.decode(errors="replace")[-2000:]) from error
+        result = pickle.loads(response_bytes)
+        pages = []
+        for record in result["images"]:
+            if record["jpeg"] is None:
+                pages.append(None)
+                continue
+            with Image.open(io.BytesIO(record["jpeg"])) as source:
+                image = source.convert("RGB")
+            image.info["curator_study_original_jpeg"] = record["jpeg"]
+            pages.append(image)
+        return pages, False, result["page_count"]
+
+    def teardown(self):
+        if getattr(self, "_persistent_fitted_client", None) is not None:
+            from experiments.local_parse.persistent_renderer import teardown
+            teardown(self)
+        super().teardown()
 
     @staticmethod
     def _valid_render_result(pages: object, count: int) -> bool:
@@ -347,6 +403,28 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             "materialize_error": json.dumps({"stage": stage, "type": "PDFError", "message": message}),
         }
 
+    @staticmethod
+    def _study_image_fields(payload, image):
+        if not payload or not os.environ.get("CURATOR_STUDY_RASTER"):
+            return {}
+        if os.environ.get("CURATOR_STUDY_RASTER") == "matched":
+            with Image.open(io.BytesIO(payload)) as decoded:
+                rgb = decoded.convert("RGB")
+        else:
+            rgb = image.convert("RGB")
+        return {"encoded_sha256": hashlib.sha256(payload).hexdigest(),
+                "rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
+                "width": rgb.width, "height": rgb.height,
+                "encoding": "jpeg" if payload.startswith(b"\xff\xd8") else "png"}
+
+    @staticmethod
+    def _study_page_bytes(image):
+        if os.environ.get("CURATOR_STUDY_RASTER") != "matched":
+            return image_to_bytes(image)
+        if "curator_study_original_jpeg" in image.info:
+            return image.info["curator_study_original_jpeg"]
+        raise RuntimeError("Matched raster must originate in the pinned shared NRL helper")
+
     def _page_row(
         self, sample_id: str, file_name: str, url: str, page_num: int, page_img: Image.Image | None
     ) -> dict[str, Any]:
@@ -354,9 +432,9 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             "sample_id": sample_id,
             "position": page_num,
             "modality": "page_image",
-            "content_type": "image/png",
+            "content_type": "image/jpeg" if os.environ.get("CURATOR_STUDY_RASTER") == "matched" else "image/png",
             "text_content": "",
-            "binary_content": None if page_img is None else image_to_bytes(page_img),
+            "binary_content": None if page_img is None else self._study_page_bytes(page_img),
             "source_ref": None,
             "url": url,
             "pdf_name": file_name,
@@ -376,6 +454,16 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             msg = "Page task does not match this renderer's admitted extraction identity"
             raise ExtractionConfigMismatchError(msg)
         rows: list[dict[str, Any]] = []
+        early_sink = getattr(self, "_early_row_sink", None)
+
+        def collect_failure_rows(new_rows):
+            for row in new_rows:
+                if early_sink is not None:
+                    trace.emit("page_raster_failed", **trace.page_fields(row))
+                    early_sink(row)
+                    rows.append({**row, "binary_content": None})
+                else:
+                    rows.append(row)
 
         parsed: list[dict] = [json.loads(e) for e in task.data]
         if task._metadata.get("pdf_page_chunks") and not self.retain_failures:
@@ -405,21 +493,29 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 metrics["pdf_read_s"] += time.perf_counter() - started
 
         for idx, entry in enumerate(parsed):
+            if early_sink is not None:
+                early_sink.flush_range()
             file_name = entry["file_name"]
             url = entry.get("url", "")
             sample_id = file_name.rsplit(".", 1)[0]
 
             started = time.perf_counter() if metrics is not None else None
+            trace.emit("pdf_source_read_begin", pdf_name=file_name,
+                       document_id=(entry.get("_page_chunk") or {}).get("document_id"),
+                       source_sha256=(entry.get("_page_chunk") or {}).get("source_version"))
             if jsonl_bytes is not None:
                 pdf_bytes = jsonl_bytes.get(idx)
             else:
                 pdf_bytes = self._get_pdf_bytes(file_name, entry=entry)
+            trace.emit("pdf_source_read_end", pdf_name=file_name,
+                       document_id=(entry.get("_page_chunk") or {}).get("document_id"),
+                       source_bytes=len(pdf_bytes) if pdf_bytes is not None else None)
             if metrics is not None:
                 metrics["pdf_read_s"] += time.perf_counter() - started
                 metrics["pdf_source_bytes"] += len(pdf_bytes) if pdf_bytes is not None else 0
             if pdf_bytes is None:
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "read_pdf", "Could not read PDF"))
+                    collect_failure_rows(failed_rows(entry, sample_id, url, "read_pdf", "Could not read PDF"))
                 logger.warning(f"Could not read PDF: {file_name}")
                 continue
 
@@ -432,7 +528,7 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
             ):
                 msg = "selected_page_indices must be a nonempty list of unique nonnegative integers"
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "manifest", msg))
+                    collect_failure_rows(failed_rows(entry, sample_id, url, "manifest", msg))
                 logger.warning(f"Invalid selected_page_indices for {file_name}: {page_indices!r}")
                 continue
 
@@ -447,24 +543,41 @@ class PDFPreprocessStage(ProcessingStage[FileGroupTask, InterleavedBatch]):
                 metrics["pdf_render_s"] += time.perf_counter() - started
             if not page_images:
                 if self.retain_failures:
-                    rows.extend(failed_rows(entry, sample_id, url, "render_pdf", "No render result"))
+                    collect_failure_rows(failed_rows(entry, sample_id, url, "render_pdf", "No render result"))
                 logger.warning(f"No pages rendered from {file_name}; skipping")
                 continue
 
             logger.debug(f"Rendered {file_name}: {len(page_images)} pages")
             physical_indexes = range(len(page_images)) if page_indices is None else page_indices
-            page_rows = (
-                self._page_row(sample_id, file_name, url, page_num, page_img)
-                for page_num, page_img in zip(physical_indexes, page_images, strict=True)
-                if self.retain_failures or page_img is not None
-            )
-            if chunk := entry.get("_page_chunk"):
-                rows.extend({**row, "document_id": chunk["document_id"]} for row in page_rows)
-            else:
-                rows.extend(page_rows)
+            chunk = entry.get("_page_chunk")
+            for page_num, page_img in zip(physical_indexes, page_images, strict=True):
+                if self.retain_failures or page_img is not None:
+                    row = self._page_row(sample_id, file_name, url, page_num, page_img)
+                    if chunk:
+                        row["document_id"] = chunk["document_id"]
+                    if early_sink is None:
+                        rows.append(row)
+                    if trace.enabled():
+                        payload = row["binary_content"]
+                        trace.emit("page_raster_ready", **trace.page_fields(row), status="ready" if payload else "failed",
+                                   encoded_bytes=len(payload or b""),
+                                   png_sha256=hashlib.sha256(payload).hexdigest() if payload else None,
+                                   **self._study_image_fields(payload, page_img))
+                    if early_sink is not None:
+                        early_sink(row)
+                        # Full binary payload ownership moves into separately
+                        # credited input/held-result stores. This ordered stub
+                        # exists only to preserve the original parent metadata.
+                        rows.append({**row, "binary_content": None})
 
+        if early_sink is not None:
+            early_sink.flush_range()
         if not rows:
             return None
+        if trace.enabled() and early_sink is None:
+            for row in rows:
+                if row.get("page_number") is not None and not row.get("binary_content"):
+                    trace.emit("page_raster_failed", **trace.page_fields(row))
         if metrics is not None:
             self._log_metrics(metrics)
 

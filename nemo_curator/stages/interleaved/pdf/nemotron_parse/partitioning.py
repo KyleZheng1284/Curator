@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import dataclass, field
 
 from loguru import logger
@@ -181,7 +182,15 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
         entries = self._parse_manifest()
         if self.pages_per_task is not None:
             tasks = self._chunk_tasks(entries)
-            return self._order_page_tasks(tasks) if self.page_task_priorities else tasks
+            if self.page_task_priorities:
+                return self._order_page_tasks(tasks)
+            if any(os.environ.get(key) for key in (
+                "PARSE35_PAGE64_PRIORITY_PATH", "PARSE35_PAGE64_PRIORITY_SHA256", "PARSE35_PAGE64_PRIORITY_MODE",
+            )):
+                from experiments.local_parse.parent_priority import configured, order_parents
+
+                return order_parents(tasks, self.manifest_path, self.pages_per_task, configured())
+            return tasks
 
         tasks: list[FileGroupTask] = []
         for i in range(0, len(entries), self.pdfs_per_task):

@@ -23,11 +23,14 @@ import hashlib
 import importlib.metadata
 import io
 import json
+import os
+import threading
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar, copy_context
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
+from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
@@ -36,6 +39,7 @@ from loguru import logger
 from packaging.version import Version
 from PIL import Image
 
+from nemo_curator import _parse35_stage_trace as trace
 from nemo_curator.models.client.llm_client import GenerationConfig
 from nemo_curator.models.client.openai_client import AsyncOpenAIClient
 from nemo_curator.stages.base import ProcessingStage
@@ -437,6 +441,13 @@ class _HTTPPageResult:
     finish_reason: str | None = None
 
 
+class _ProfiledOpenAIClient(AsyncOpenAIClient):
+    async def _query_model_response_impl(self, **kwargs):
+        # The client's semaphore is already held when this method is called.
+        trace.emit("backend_dispatch")
+        return await super()._query_model_response_impl(**kwargs)
+
+
 @dataclass
 class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
     """Call Nemotron-Parse through an OpenAI-compatible HTTP endpoint.
@@ -456,7 +467,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     single mode. It is disabled by default; unverified inputs are encoded normally.
     """
 
-    endpoint: str
+    endpoint: str | None
     model_name: str
     model_path: str | None = None
     parse_mode: str | None = field(default=None, kw_only=True)
@@ -514,30 +525,62 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
 
     def setup(self, worker_metadata: dict | None = None) -> None:  # noqa: ARG002
         if self.parse_mode is not None:
-            try:
-                from nemotron_parse.inference import DocumentParser
-            except ImportError as exc:
-                raise ImportError(_PARSE_INSTALL_HINT) from exc
-            self._require_served_model()
-            self._parser = DocumentParser(model=self.model_name, backend=self._parse_backend)
-            if self.extraction_config is not None:
-                from nemotron_parse.inference import PROMPT
+            self._startup_ready_file = os.environ.get("PARSE35_HTTP_READY_FILE")
+            self._setup_parse_parser(check_http=not self._startup_ready_file)
 
-                self.extraction_config = validate_extraction_config(self.extraction_config)
-                if self.parse_mode != "single" or self.extraction_config["parser"] != parser_package_identity():
-                    msg = "Admitted parser package or parse mode differs from this worker"
-                    raise ExtractionConfigMismatchError(msg)
-                if self.extraction_config["transport"] != {
-                    "request_timeout_s": self.request_timeout_s,
-                    "max_retries": self.max_retries,
-                    "retry_base_delay_s": self.retry_base_delay_s,
-                }:
-                    msg = "Admitted HTTP timeout/retry settings differ from this worker"
-                    raise ExtractionConfigMismatchError(msg)
-                generation = _server_generation_config(
-                    {**asdict(self._parser.settings["fullpage"]), "skip_special_tokens": False}
-                )
-                self._check_extraction_request(PROMPT, "fullpage", generation)
+    def _await_http_startup(self) -> None:
+        path = getattr(self, "_startup_ready_file", None)
+        if path is None:
+            return
+        ready = Path(path)
+        if not ready.is_absolute():
+            raise RuntimeError("HTTP startup readiness must use the private run's absolute path")
+        now = time.monotonic()
+        wall_deadline = os.environ.get("PARSE35_HTTP_READY_DEADLINE_UNIX")
+        deadline = now + (self.request_timeout_s if wall_deadline is None else float(wall_deadline) - time.time())
+        trace.emit("http_startup_gate_begin")
+        while not ready.is_file():
+            cancel = getattr(self, "_early_cancel_event", None)
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Early-admission parent cancelled before HTTP startup readiness")
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Both owned HTTP engines did not reach readiness")
+            time.sleep(0.05)
+        self._require_served_model()
+        self._startup_ready_file = None
+        trace.emit("http_startup_gate_end")
+
+    def _setup_parse_parser(self, *, check_http: bool = False) -> None:
+        try:
+            from nemotron_parse.inference import DocumentParser
+        except ImportError as exc:
+            raise ImportError(_PARSE_INSTALL_HINT) from exc
+        if check_http:
+            self._require_served_model()
+        self._parser = DocumentParser(model=self.model_name, backend=self._parse_backend)
+        if self.extraction_config is not None:
+            from nemotron_parse.inference import PROMPT
+
+            self.extraction_config = validate_extraction_config(self.extraction_config)
+            if self.parse_mode != "single" or self.extraction_config["parser"] != parser_package_identity():
+                msg = "Admitted parser package or parse mode differs from this worker"
+                raise ExtractionConfigMismatchError(msg)
+            if self.extraction_config["transport"] != self._transport_identity():
+                msg = "Admitted transport settings differ from this worker"
+                raise ExtractionConfigMismatchError(msg)
+            generation = _server_generation_config(
+                {**asdict(self._parser.settings["fullpage"]), "skip_special_tokens": False}
+            )
+            self._check_extraction_request(PROMPT, "fullpage", generation)
+
+    def _transport_identity(self) -> dict[str, Any]:
+        return {
+            "request_timeout_s": self.request_timeout_s,
+            "max_retries": self.max_retries,
+            "retry_base_delay_s": self.retry_base_delay_s,
+            **({"explicit_image_placeholder": "<pad>", "blank_policy": "rgb-uint8-std-lt-0.01"}
+               if os.environ.get("CURATOR_STUDY_RASTER") else {}),
+        }
 
     def _check_extraction_request(self, prompt: str, stage: str, generation: GenerationConfig) -> None:
         if self.extraction_config is not None:
@@ -553,7 +596,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
 
     def _require_served_model(self) -> None:
         # Page failures become rows rather than raising, so an unusable endpoint must fail here.
-        url = f"{self.endpoint.rstrip('/')}/models"
+        url = f"{self._http_endpoint()}/models"
         for attempt in range(self.max_retries + 1):
             try:
                 with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310
@@ -567,6 +610,12 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         if self.model_name not in served:
             msg = f"{url} does not serve {self.model_name!r}; it serves {sorted(served)}"
             raise RuntimeError(msg)
+
+    def _http_endpoint(self) -> str:
+        if self.endpoint is None:
+            msg = "HTTP inference requires an endpoint"
+            raise ValueError(msg)
+        return self.endpoint.rstrip("/")
 
     def teardown(self) -> None:
         if getattr(self, "_parser", None) is not None:
@@ -601,17 +650,19 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
                 metrics["image_reuse_fallback_count"] = metrics.get("image_reuse_fallback_count", 0) + 1
         generation = _server_generation_config({**asdict(settings), "skip_special_tokens": False})
         self._check_extraction_request(prompt, stage, generation)
-        response = asyncio.run_coroutine_threadsafe(
-            self._query_parse_page(
-                client,
-                image_bytes,
-                prompt=prompt,
-                generation=generation,
-                stage=stage,
-                requests=_PARSE_REQUESTS.get(),
-            ),
-            loop,
-        ).result()
+        with trace.request():
+            trace.emit("backend_submit", width=image.width, height=image.height, raster_bytes=len(image_bytes))
+            response = asyncio.run_coroutine_threadsafe(
+                self._query_parse_page(
+                    client,
+                    image_bytes,
+                    prompt=prompt,
+                    generation=generation,
+                    stage=stage,
+                    requests=_PARSE_REQUESTS.get(),
+                ),
+                loop,
+            ).result()
         return {
             "raw_out": response.text,
             "finish_reason": response.finish_reason,
@@ -632,10 +683,12 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         requests.append(record)
         try:
             response = await self._query_page(
-                client, image_bytes, "image/png", prompt=prompt, generation_config=generation
+                client, image_bytes, "image/jpeg" if image_bytes.startswith(b"\xff\xd8") else "image/png",
+                prompt=prompt, generation_config=generation
             )
         except Exception as exc:
             record["error"] = type(exc).__name__
+            trace.emit("backend_error", error_type=type(exc).__name__)
             raise
         record.update(
             raw_out=response.text,
@@ -648,12 +701,13 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     async def _parse_pages(
         self, pages: list[dict[str, Any]], *, reuse_encoded_images: bool = False
     ) -> list[dict[str, Any]]:
-        client = AsyncOpenAIClient(
+        client_type = _ProfiledOpenAIClient if trace.enabled() else AsyncOpenAIClient
+        client = client_type(
             max_concurrent_requests=self.inference_batch_size,
             max_retries=self.max_retries,
             base_delay=self.retry_base_delay_s,
             api_key="unused",  # pragma: allowlist secret
-            base_url=self.endpoint.rstrip("/"),
+            base_url=self._http_endpoint(),
             timeout=self.request_timeout_s,
         )
         loop = asyncio.get_running_loop()
@@ -664,60 +718,12 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
 
         async def parse_page(row: dict[str, Any]) -> dict[str, Any]:
             if row.get("materialize_error"):
+                trace.emit("page_parse_done", **trace.page_fields(row), status="skipped_render_failure")
                 return {**row, "parse_document": None}
-            requests: list[dict[str, Any]] = []
-            request_token = _PARSE_REQUESTS.set(requests)
-            image_metrics: dict[str, int] = {}
-            image_token = _PARSE_IMAGE_METRICS.set(image_metrics)
-            document = None
-            try:
-                async with semaphore:
-                    image_args = (row["binary_content"], True) if reuse_encoded_images else (row["binary_content"],)
-                    document = await loop.run_in_executor(
-                        parser_pool, copy_context().run, self._parse_image, *image_args
-                    )
-                if not isinstance(document, dict) or not document.get("blocks"):
-                    error = {
-                        "stage": "parse_output",
-                        "type": "NoDecodedBlocks",
-                        "message": "Model response produced no decoded blocks",
-                        "raw_response": document,
-                        "requests": requests,
-                    }
-                    result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
-                else:
-                    result = {**row, "parse_document": json.dumps(document), "materialize_error": None}
-            except Exception as exc:
-                if isinstance(exc, ExtractionConfigMismatchError):
-                    raise
-                error = {
-                    "stage": getattr(exc, "stage", "parse_request"),
-                    "type": type(exc).__name__,
-                    "message": str(exc),
-                }
-                if (response := getattr(exc, "response", None)) is not None:
-                    error["raw_response"] = (
-                        response
-                        if isinstance(response, dict)
-                        else {
-                            "status_code": getattr(response, "status_code", None),
-                            "body": getattr(exc, "body", None),
-                        }
-                    )
-                if requests:
-                    error["requests"] = requests
-                result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
-            finally:
-                _PARSE_REQUESTS.reset(request_token)
-                _PARSE_IMAGE_METRICS.reset(image_token)
-            result["_parse_metrics"] = {
-                "num_requests": len(requests),
-                "num_failed_requests": sum("error" in request for request in requests),
-                "total_prompt_tokens": sum(request.get("prompt_tokens", 0) for request in requests),
-                "total_output_tokens": sum(request.get("completion_tokens", 0) for request in requests),
-                **image_metrics,
-            }
-            return result
+            async with semaphore:
+                return await loop.run_in_executor(
+                    parser_pool, copy_context().run, self._parse_page, row, reuse_encoded_images
+                )
 
         try:
             return list(await asyncio.gather(*(parse_page(row) for row in pages)))
@@ -729,17 +735,88 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
                 with contextlib.suppress(Exception):
                     await client.client.close()
 
+    def _parse_page(self, row: dict[str, Any], reuse_encoded_images: bool = False) -> dict[str, Any]:
+        with trace.page(row):
+            trace.emit("page_prepare_begin")
+            result = self._parse_page_impl(row, reuse_encoded_images)
+            trace.emit("page_parse_done", status="failed" if result.get("materialize_error") else "success")
+            return result
+
+    def _parse_page_impl(self, row: dict[str, Any], reuse_encoded_images: bool) -> dict[str, Any]:
+        if row.get("materialize_error"):
+            return {**row, "parse_document": None}
+        if os.environ.get("CURATOR_STUDY_RASTER"):
+            import numpy as np
+            with Image.open(io.BytesIO(row["binary_content"])) as blank_probe:
+                blank = float(np.asarray(blank_probe.convert("RGB"), dtype=np.uint8).std()) < 0.01
+            if blank:
+                trace.emit("study_blank_bypass")
+                return {**row, "parse_document": json.dumps({"blocks": []}), "materialize_error": None,
+                        "_parse_metrics": {"num_requests": 0, "num_failed_requests": 0,
+                                           "total_prompt_tokens": 0, "total_output_tokens": 0}}
+        requests: list[dict[str, Any]] = []
+        request_token = _PARSE_REQUESTS.set(requests)
+        image_metrics: dict[str, int] = {}
+        image_token = _PARSE_IMAGE_METRICS.set(image_metrics)
+        try:
+            image_args = (row["binary_content"], True) if reuse_encoded_images else (row["binary_content"],)
+            document = self._parse_image(*image_args)
+            if not isinstance(document, dict) or not document.get("blocks"):
+                error = {
+                    "stage": "parse_output",
+                    "type": "NoDecodedBlocks",
+                    "message": "Model response produced no decoded blocks",
+                    "raw_response": document,
+                    "requests": requests,
+                }
+                result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
+            else:
+                result = {**row, "parse_document": json.dumps(document), "materialize_error": None}
+        except ExtractionConfigMismatchError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - Page parser errors belong in the page result.
+            error = {
+                "stage": getattr(exc, "stage", "parse_request"),
+                "type": type(exc).__name__,
+                "message": str(exc),
+            }
+            if (response := getattr(exc, "response", None)) is not None:
+                error["raw_response"] = (
+                    response
+                    if isinstance(response, dict)
+                    else {
+                        "status_code": getattr(response, "status_code", None),
+                        "body": getattr(exc, "body", None),
+                    }
+                )
+            if requests:
+                error["requests"] = requests
+            result = {**row, "parse_document": None, "materialize_error": json.dumps(error)}
+        finally:
+            _PARSE_REQUESTS.reset(request_token)
+            _PARSE_IMAGE_METRICS.reset(image_token)
+        result["_parse_metrics"] = {
+            "num_requests": len(requests),
+            "num_failed_requests": sum("error" in request for request in requests),
+            "total_prompt_tokens": sum(request.get("prompt_tokens", 0) for request in requests),
+            "total_output_tokens": sum(request.get("completion_tokens", 0) for request in requests),
+            **image_metrics,
+        }
+        return result
+
     def _parse_image(self, image_bytes: bytes, reuse_encoded_image: bool = False) -> dict[str, Any]:
         with io.BytesIO(image_bytes) as stream, Image.open(stream) as image:
             prepared = None
             if reuse_encoded_image and self.reuse_encoded_images and self.parse_mode == "single":
                 image.load()
+                if os.environ.get("CURATOR_STUDY_RASTER") == "matched" and image.format == "JPEG":
+                    image.info.clear()
                 if (
-                    image.format == "PNG"
+                    (image.format == "PNG" or (os.environ.get("CURATOR_STUDY_RASTER") == "matched" and image.format == "JPEG"))
                     and image.mode == "RGB"
                     and not image.info
                     and not getattr(image, "encoderinfo", {})
-                    and image.n_frames == 1
+                    and getattr(image, "n_frames", 1) == 1
                 ):
                     prepared = (image_bytes, image.size, hashlib.sha256(image.tobytes()).digest())
             token = _PARSE_ENCODED_IMAGE.set(prepared)
@@ -749,6 +826,16 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
                 _PARSE_ENCODED_IMAGE.reset(token)
 
     def _process_parse(self, task: InterleavedBatch) -> InterleavedBatch:
+        started = time.perf_counter()
+        pages = self._prepare_parse_task(task)
+        reuse_encoded_images = self.reuse_encoded_images and has_png_batch_provenance(
+            task._metadata, (row.get("binary_content") for row in pages)
+        )
+        self._await_http_startup()
+        rows = asyncio.run(self._parse_pages(pages, reuse_encoded_images=reuse_encoded_images))
+        return self._finish_parse_task(task, rows, started)
+
+    def _prepare_parse_task(self, task: InterleavedBatch) -> list[dict[str, Any]]:
         if getattr(self, "_parser", None) is None:
             msg = "Call setup() before processing served Parse 3.5 pages"
             raise RuntimeError(msg)
@@ -758,16 +845,19 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         ):
             msg = "Page task does not match this worker's admitted extraction identity"
             raise ExtractionConfigMismatchError(msg)
-        started = time.perf_counter()
         table = task.to_pyarrow()
         if "page_number" not in table.column_names:
             msg = "Served Parse 3.5 requires physical page numbers; use PDFPreprocessStage(retain_failures=True)"
             raise ValueError(msg)
         pages = table.to_pylist()
-        reuse_encoded_images = self.reuse_encoded_images and has_png_batch_provenance(
-            task._metadata, (row.get("binary_content") for row in pages)
-        )
-        rows = asyncio.run(self._parse_pages(pages, reuse_encoded_images=reuse_encoded_images))
+        if trace.enabled():
+            for row in pages:
+                trace.emit("page_received", **trace.page_fields(row))
+        return pages
+
+    def _finish_parse_task(
+        self, task: InterleavedBatch, rows: list[dict[str, Any]], started: float
+    ) -> InterleavedBatch:
         metrics = {
             "inference_server_request_time": time.perf_counter() - started,
             "num_input_pages": float(sum(row.get("page_number") is not None for row in rows)),
@@ -799,10 +889,13 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
                 "proc_size": list(self.proc_size),
                 "model_path": self.model_path or self.model_name,
                 "parse_mode": self.parse_mode,
-                "inference_server_endpoint": self.endpoint,
+                **self._parse_transport_metadata(),
             },
             _stage_perf=task._stage_perf,
         )
+
+    def _parse_transport_metadata(self) -> dict[str, Any]:
+        return {"inference_server_endpoint": self.endpoint}
 
     async def _query_page(
         self,
@@ -814,22 +907,34 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         generation_config: GenerationConfig | None = None,
     ) -> _HTTPPageResult:
         image_url = f"data:{content_type};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        generation_config = generation_config or self._generation_config
+        if (request_id := trace.request_id()) is not None:
+            generation_config = replace(
+                generation_config,
+                extra_kwargs={**(generation_config.extra_kwargs or {}), "extra_headers": {"X-Request-Id": request_id}},
+            )
         response = await client.query_model_response(
             model=self.model_name,
             messages=[
                 {
                     "role": "user",
                     "content": [
-                        {"type": "text", "text": prompt if prompt is not None else self.task_prompt or ""},
+                        {"type": "text", "text": ("<pad>" if os.environ.get("CURATOR_STUDY_RASTER") else "")
+                         + (prompt if prompt is not None else self.task_prompt or "")},
                         {"type": "image_url", "image_url": {"url": image_url}},
                     ],
                 }
             ],
-            generation_config=generation_config or self._generation_config,
+            generation_config=generation_config,
         )
 
         choice = response.choices[0] if response.choices else None
         usage = response.usage
+        if trace.request_id() is not None:
+            trace.emit("backend_response", response_id=getattr(response, "id", None),
+                       prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                       completion_tokens=int(getattr(usage, "completion_tokens", 0) or 0),
+                       finish_reason=getattr(choice, "finish_reason", None))
         return _HTTPPageResult(
             text=str(getattr(getattr(choice, "message", None), "content", "") or ""),
             prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
@@ -843,7 +948,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             max_retries=self.max_retries,
             base_delay=self.retry_base_delay_s,
             api_key="unused",  # pragma: allowlist secret
-            base_url=self.endpoint.rstrip("/"),
+            base_url=self._http_endpoint(),
             timeout=self.request_timeout_s,
         )
         try:
