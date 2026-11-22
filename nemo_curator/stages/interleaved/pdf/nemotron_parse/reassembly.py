@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
 from typing import Any, ClassVar
 
@@ -15,7 +15,11 @@ import pyarrow as pa
 import pyarrow.compute as pc
 
 from nemo_curator.stages.base import ProcessingStage
-from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import identity_digest
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
+    identity_digest,
+    iter_manifest_documents,
+    output_inventory_scope,
+)
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.schema import PAGE_OUTPUT_SCHEMA, align_page_output
 from nemo_curator.tasks import InterleavedBatch
 
@@ -75,11 +79,22 @@ def validate_document_rows(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], 
 
 @dataclass
 class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch]):
-    """Group extracted ranges by document. Fan-in is not checkpoint resumable."""
+    """Merge a document's extracted ranges once they cover its declared pages.
+
+    With a manifest, admitted ranges can arrive in any order and are held until the document is complete.
+    Final validation uses the same selection to catch missing documents. The standalone grouped form receives
+    all ranges of a document at once. Fan-in is not checkpoint resumable.
+    """
 
     name: str = "pdf_document_merge"
     is_resumable: bool = False
-    required_finalizer: ClassVar[str] = "pdf_page_budget_validation"
+    _supports_fan_in_fusion: ClassVar[bool] = True
+    manifest_path: str | None = field(default=None, kw_only=True)
+    max_pdfs: int | None = field(default=None, kw_only=True)
+    file_name_field: str = field(default="file_name", kw_only=True)
+    _admitted: frozenset[str] | None = field(default=None, init=False, repr=False)
+    _held: dict[str, tuple[int, dict[int, InterleavedBatch]]] = field(default_factory=dict, init=False, repr=False)
+    _merged: set[str] = field(default_factory=set, init=False, repr=False)
 
     def inputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
@@ -87,8 +102,16 @@ class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
     def outputs(self) -> tuple[list[str], list[str]]:
         return ["data"], []
 
+    @property
+    def required_finalizer(self) -> str | tuple[str, str, int | None, str]:
+        if self.manifest_path is None:
+            return "pdf_page_budget_validation"
+        return output_inventory_scope(self.manifest_path, self.max_pdfs, self.file_name_field)
+
     def ray_stage_spec(self) -> dict[str, Any]:
-        return {"group_by_metadata": "pdf_document_id"}
+        if self.manifest_path is None:
+            return {"group_by_metadata": "pdf_document_id"}
+        return {"streaming_fan_in": True}
 
     def process(self, _task: InterleavedBatch) -> InterleavedBatch:
         msg = "PDFDocumentMergeStage requires grouped execution with RayDataExecutor"
@@ -97,6 +120,36 @@ class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
     def process_batch(self, tasks: list[InterleavedBatch]) -> list[InterleavedBatch]:
         if len(tasks) == 0:
             return []
+        if self.manifest_path is None:
+            return [self._merge(tasks)]
+        if self._admitted is None:
+            self._admitted = frozenset(
+                doc["document_id"]
+                for doc in iter_manifest_documents(self.manifest_path, self.max_pdfs, self.file_name_field)
+            )
+        documents = []
+        for task in tasks:
+            chunk = task._metadata["pdf_chunk"]
+            document_id = chunk["document_id"]
+            if document_id not in self._admitted:
+                msg = f"Unexpected PDF range outside the admitted manifest: {document_id}"
+                raise ValueError(msg)
+            # Remembering merged documents keeps a range that arrives again from starting its document over.
+            pages, ranges = self._held.get(document_id, (0, {}))
+            if document_id in self._merged or chunk["offset"] in ranges:
+                msg = "PDF chunks must cover consecutive, nonoverlapping ranges of one versioned document"
+                raise ValueError(msg)
+            ranges[chunk["offset"]] = task
+            pages += len(chunk["page_indices"])
+            if pages < chunk["total_pages"]:
+                self._held[document_id] = pages, ranges
+            else:
+                documents.append(self._merge(list(ranges.values())))
+                self._held.pop(document_id, None)
+                self._merged.add(document_id)
+        return documents
+
+    def _merge(self, tasks: list[InterleavedBatch]) -> InterleavedBatch:
         ordered = sorted(tasks, key=lambda task: task._metadata["pdf_chunk"]["offset"])
         first = ordered[0]._metadata["pdf_chunk"]
         offset, content, outcomes = 0, [], []
@@ -154,19 +207,17 @@ class PDFDocumentMergeStage(ProcessingStage[InterleavedBatch, InterleavedBatch])
         validate_document_rows(merged.drop(["binary_content"]).to_pylist())
         output_id = identity_digest([first["document_id"], first["selection_sha256"], document_info["pdf_provenance"]])
         self._log_metrics({"merged_chunks": float(len(ordered)), "merged_pages": float(offset)})
-        return [
-            InterleavedBatch(
-                dataset_name=ordered[0].dataset_name,
-                data=merged,
-                _metadata={
-                    **{
-                        key: value
-                        for key, value in ordered[0]._metadata.items()
-                        if key not in {"pdf_page_chunks", "pdf_chunk", "partition_index"}
-                    },
-                    "source_files": [first["source_locator"]],
-                    "output_file_id": output_id,
+        return InterleavedBatch(
+            dataset_name=ordered[0].dataset_name,
+            data=merged,
+            _metadata={
+                **{
+                    key: value
+                    for key, value in ordered[0]._metadata.items()
+                    if key not in {"pdf_page_chunks", "pdf_chunk", "partition_index"}
                 },
-                _stage_perf=[stat for task in ordered for stat in task._stage_perf],
-            )
-        ]
+                "source_files": [first["source_locator"]],
+                "output_file_id": output_id,
+            },
+            _stage_perf=[stat for task in ordered for stat in task._stage_perf],
+        )

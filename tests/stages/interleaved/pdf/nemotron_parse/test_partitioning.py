@@ -6,6 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from nemo_curator.backends.ray_actor_pool import RayActorPoolExecutor
+from nemo_curator.backends.xenna import XennaExecutor
+from nemo_curator.pipeline import Pipeline
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import PDFPartitioningStage
 from nemo_curator.tasks import EmptyTask
 from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import partition, write_manifest
@@ -60,6 +63,19 @@ def test_default_partitioning_keeps_existing_manifest_contract(tmp_path: Path):
     assert len(tasks) == 1
     assert "pdf_page_chunks" not in tasks[0]._metadata
     assert [json.loads(entry)["file_name"] for entry in tasks[0].data] == ["a.pdf", "b.pdf"]
+
+
+@pytest.mark.parametrize("executor_type", [XennaExecutor, RayActorPoolExecutor])
+def test_standalone_page_partitioner_can_run_on_other_backends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, executor_type: type
+):
+    manifest = write_manifest(tmp_path, [{"file_name": "p.pdf", "num_pages": 3}])
+    stage = PDFPartitioningStage(manifest_path=str(manifest), pages_per_task=2)
+    executor = executor_type()
+    # Exercise public pipeline admission and the real stage without launching a cluster.
+    monkeypatch.setattr(executor, "execute", lambda stages, _initial_tasks: stages[0].process(EmptyTask()))
+    tasks = Pipeline(name="partition", stages=[stage]).run(executor)
+    assert [task._metadata["partition_index"] for task in tasks] == [0, 1]
 
 
 def test_page_mode_does_not_silently_skip_malformed_manifest_records(tmp_path: Path):

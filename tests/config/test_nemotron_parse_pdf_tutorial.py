@@ -15,6 +15,7 @@
 """Exercise external endpoint tutorial wiring without starting serving or Ray."""
 
 import importlib.util
+import json
 import re
 import sys
 import tomllib
@@ -23,6 +24,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
 import pytest
+
+from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG
 
 TUTORIAL = Path(__file__).parents[2] / "tutorials/interleaved/nemotron_parse_pdf"
 
@@ -136,6 +139,44 @@ def test_tutorial_defaults_to_served_parse35_and_warn_writer(monkeypatch: pytest
     pipeline = module.create_nemotron_parse_pdf_pipeline(args, inference_server_endpoint="http://served/v1")
     assert pipeline.stages[-1].on_materialize_error == "warn"
     assert pipeline.stages[0]._inference.parse_mode == "single"
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_stream_page_tasks_switches_only_the_requested_pipeline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stream: bool
+):
+    module = load_module(monkeypatch, "pipeline_utils")
+    config = tmp_path / "contract.json"
+    config.write_text(json.dumps(TEST_EXTRACTION_CONFIG))
+    args = module.create_nemotron_parse_pdf_argparser().parse_args(
+        [
+            "--manifest",
+            "input.jsonl",
+            "--pdf-dir",
+            ".",
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--pages-per-task",
+            "64",
+            "--page-budget-extraction-config",
+            str(config),
+            "--overlap-rendering",
+            *(["--stream-page-tasks"] if stream else []),
+        ]
+    )
+    pipeline = module.create_nemotron_parse_pdf_pipeline(args, inference_server_endpoint="http://served/v1")
+    reader, _, validator = pipeline.stages
+    source, client, _, merge = reader.decompose_and_apply_with()
+    assert source._prefer_driver_as_source is stream
+    assert bool(client.ray_stage_spec().get("task_lookahead")) is stream
+    assert merge.ray_stage_spec() == (
+        {"streaming_fan_in": True} if stream else {"group_by_metadata": "pdf_document_id"}
+    )
+    assert validator.stream_page_tasks is stream
+
+    args.stream_page_tasks, args.overlap_rendering = True, False
+    with pytest.raises(ValueError, match="requires overlap_rendering"):
+        module.create_nemotron_parse_pdf_pipeline(args, inference_server_endpoint="http://served/v1")
 
 
 def test_tutorial_explicit_legacy_path_remains_available(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

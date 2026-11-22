@@ -414,6 +414,12 @@ python tutorials/interleaved/nemotron_parse_pdf/main.py \
     --pages-per-task 64 --page-budget-extraction-config extraction.json
 ```
 
+To stream the same workload, append `--overlap-rendering --stream-page-tasks`.
+Workers can render the next assigned task while HTTP requests finish, and
+each complete PDF can reach the writer while other PDFs are still processing.
+Page packing follows manifest order. See [Stream Page Tasks](../../../fern/versions/main/pages/curate-text/load-data/nemotron-parse-pdf.mdx#stream-page-tasks)
+for placement, final readback and recovery.
+
 Use a fresh, locally addressed output directory for each run and verify its backing
 mount; a local filesystem API does not prove SSD storage or exclude NFS. On a
 multi-node cluster, every writer node and the validating driver must access the
@@ -435,8 +441,8 @@ wins. It is not crash durability, no-clobber publication, exactly-once inference
 or a multi-document transaction. Interrupted temporary files are retained. A run
 that raises during writing or final validation leaves already-published files;
 those files alone do not establish completion.
-Regrouping is a global barrier, with materialized planning/inventory/results and
-no regrouping checkpoint support; the page budget does not bound total memory.
+By default, regrouping is a global barrier. Both modes materialize planning,
+inventory and results in memory. Regrouping has no checkpoint support.
 
 ## Reproducing the Parse 3.5 serving benchmarks
 

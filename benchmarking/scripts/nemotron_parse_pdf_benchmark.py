@@ -366,6 +366,7 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "raster_max_size": getattr(args, "raster_max_size", None),
             "persistent_rendering": getattr(args, "persistent_rendering", False),
             "overlap_rendering": overlap_rendering,
+            "stream_page_tasks": getattr(args, "stream_page_tasks", False),
             "max_pages": args.max_pages,
             "inference_batch_size": args.inference_batch_size,
             "max_num_seqs": (

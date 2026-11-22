@@ -132,6 +132,7 @@ def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
     args.num_replicas = 2
     args.inference_server_num_gpus = 1
     args.overlap_rendering = overlap_rendering
+    args.stream_page_tasks = overlap_rendering
     probe.return_value = client_gpus
     pipeline.run.return_value = [Mock()]
     monkeypatch.setattr(module, "_count_unique_pdfs", lambda _tasks: 1)
@@ -147,6 +148,7 @@ def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
     result = module.run_nemotron_parse_pdf_benchmark(args)
     assert result["metrics"]["is_success"]
     assert result["params"]["num_replicas"] == 2
+    assert result["params"]["stream_page_tasks"] is overlap_rendering
     assert result["params"]["num_inference_gpus"] == 1
     assert build.call_args.kwargs["inference_server_client_num_workers"] == 8
     inference_rate = "inference_stage_pages_per_sec_per_gpu"

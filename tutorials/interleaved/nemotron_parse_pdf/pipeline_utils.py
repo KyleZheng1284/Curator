@@ -98,6 +98,11 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         help="Submit completed render ranges while rendering continues in served page mode (up to 64 pages per task)",
     )
     parser.add_argument(
+        "--stream-page-tasks",
+        action="store_true",
+        help="Stream page tasks through document publication and validation (requires --overlap-rendering)",
+    )
+    parser.add_argument(
         "--max-pages",
         type=int,
         default=50,
@@ -172,6 +177,7 @@ def create_nemotron_parse_pdf_pipeline(
     serving GPU and start with ``args.inference_batch_size=32``. Tune request
     concurrency on the target hardware and corpus.
     """
+    stream_page_tasks = getattr(args, "stream_page_tasks", False)
     extraction_config = None
     if getattr(args, "pages_per_task", None) is not None:
         config_path = getattr(args, "page_budget_extraction_config", None)
@@ -199,6 +205,7 @@ def create_nemotron_parse_pdf_pipeline(
             raster_max_size=tuple(getattr(args, "raster_max_size", DEFAULT_RASTER_MAX_SIZE)),
             persistent_rendering=getattr(args, "persistent_rendering", False),
             overlap_rendering=getattr(args, "overlap_rendering", False),
+            stream_page_tasks=stream_page_tasks,
             max_pages=args.max_pages,
             inference_batch_size=args.inference_batch_size,
             max_num_seqs=args.max_num_seqs,
@@ -237,6 +244,7 @@ def create_nemotron_parse_pdf_pipeline(
             PDFPageBudgetValidationStage(
                 manifest_path=args.manifest,
                 expected_output_version=output_version({"pdf_extraction_config": extraction_config}),
+                stream_page_tasks=stream_page_tasks,
                 max_pdfs=args.max_pdfs,
                 file_name_field=args.file_name_field,
                 url_field=args.url_field,

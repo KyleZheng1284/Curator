@@ -86,7 +86,9 @@ def test_pipeline_leaves_ray_spec_to_the_ray_data_executor():
     executor.execute.assert_called_once()
 
 
-@pytest.mark.parametrize("spec", [{"group_by_metadata": "document_id"}, {"run_on_driver": True}])
+@pytest.mark.parametrize(
+    "spec", [{"group_by_metadata": "document_id"}, {"streaming_fan_in": True}, {"run_on_driver": True}]
+)
 def test_pipeline_rejects_generic_ray_only_stage_on_xenna(spec: dict):
     stage = _NoopStage().with_(ray_stage_spec=spec)
     with pytest.raises(ValueError, match=r"noop.*require RayDataExecutor"):

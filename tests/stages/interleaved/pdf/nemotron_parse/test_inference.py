@@ -486,7 +486,9 @@ def test_actual_parser_malformed_layout_retains_failure_and_successful_sibling()
 @pytest.fixture
 def http_endpoint():
     """Exercise real SDK sockets, response decoding, retries and keep-alive."""
-    state = SimpleNamespace(requests=[], peers=[], statuses=[], outputs={}, entered=threading.Event(), release=None)
+    state = SimpleNamespace(
+        requests=[], peers=[], statuses=[], outputs={}, respond=None, entered=threading.Event(), release=None
+    )
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -509,6 +511,8 @@ def http_endpoint():
             status = state.statuses.pop(0) if state.statuses else 200
             image_url = body["messages"][0]["content"][1]["image_url"]["url"]
             output, finish_reason = state.outputs.get(image_url, (TABLE, "stop"))
+            if state.respond is not None:
+                status, output = state.respond(image_url)
             response = (
                 {
                     "id": "test-completion",

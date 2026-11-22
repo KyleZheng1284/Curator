@@ -77,6 +77,27 @@ class _ActiveParseRequests:
     tasks: set[asyncio.Task] = field(default_factory=set)
     closed: bool = False
 
+    def cancel(self) -> None:
+        # New requests and active HTTP retries for this parser share its cancellation scope.
+        if not self.closed:
+            self.closed = True
+            for request in self.tasks:
+                request.cancel()
+
+    async def wait_for_parser(self, work: asyncio.Future) -> dict[str, Any]:
+        try:
+            # Cancelling an asyncio waiter cannot stop a parser thread.
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            self.cancel()
+            # Keep the request slot and the caller's PNG credit until the thread exits.
+            while not work.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait((work,))
+            if not work.cancelled():
+                work.exception()
+            raise
+
 
 _PARSE_ACTIVE_REQUESTS: ContextVar[_ActiveParseRequests | None] = ContextVar("active_parse_requests", default=None)
 _PARSE_TRANSPORT: ContextVar[tuple[AsyncOpenAIClient, asyncio.AbstractEventLoop]] = ContextVar("parse_transport")
@@ -693,31 +714,37 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         token = _PARSE_TRANSPORT.set((client, loop))
         semaphore = asyncio.Semaphore(self.inference_batch_size)
 
-        active = _ActiveParseRequests() if settle_on_cancel else None
-        request_token = _PARSE_ACTIVE_REQUESTS.set(active)
+        running: dict[asyncio.Future, _ActiveParseRequests] = {}
+        closed = False
 
         async def parse_page(row: dict[str, Any], reuse_encoded_images: bool) -> dict[str, Any]:
             if row.get("materialize_error"):
                 return {**row, "parse_document": None}
             async with semaphore:
-                return await loop.run_in_executor(
-                    parser_pool, copy_context().run, self._parse_page, row, reuse_encoded_images
-                )
+                if closed:
+                    raise asyncio.CancelledError
+                context = copy_context()
+                active = _ActiveParseRequests() if settle_on_cancel else None
+                context.run(_PARSE_ACTIVE_REQUESTS.set, active)
+                work = loop.run_in_executor(parser_pool, context.run, self._parse_page, row, reuse_encoded_images)
+                if active is None:
+                    return await work
+                running[work] = active
+                try:
+                    return await active.wait_for_parser(work)
+                finally:
+                    del running[work]
 
         try:
             yield parse_page
         finally:
-            if active is not None:
-                # Parser threads can submit work while their wrapper tasks get
-                # cancelled. Close that admission path before waiting for them.
-                active.closed = True
-                for task in active.tasks:
-                    task.cancel()
-                await asyncio.gather(*active.tasks, return_exceptions=True)
+            closed = True
+            if settle_on_cancel:
+                for active in running.values():
+                    active.cancel()
                 await asyncio.to_thread(parser_pool.shutdown, wait=True, cancel_futures=True)
             else:
                 parser_pool.shutdown(wait=False, cancel_futures=True)
-            _PARSE_ACTIVE_REQUESTS.reset(request_token)
             _PARSE_TRANSPORT.reset(token)
             if hasattr(client, "client"):
                 with contextlib.suppress(Exception):

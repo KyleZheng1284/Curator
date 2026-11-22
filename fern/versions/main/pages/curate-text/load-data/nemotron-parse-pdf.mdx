@@ -246,6 +246,7 @@ existing positional reader and HTTP-client calls remain compatible.
 | `raster_max_size` | tuple[int, int] | `(1664, 2048)` | Aspect-preserving render cap in pixels. |
 | `persistent_rendering` | bool | `False` | Reuse an isolated PDFium process across render ranges on the qualified runtime. |
 | `overlap_rendering` | bool | `False` | Submit completed render ranges early in served single-pass page mode with at most 64 pages per task. |
+| `stream_page_tasks` | bool | `False` | Stream page tasks across rendering, inference and document assembly. Requires `overlap_rendering=True`. See [Stream Page Tasks](#stream-page-tasks). |
 | `max_pages` | int | `50` | Per-PDF page limit in PDF-based mode; ignored in page-based mode, which processes the manifest selection. |
 | `inference_batch_size` | int | `4` | Pages per HF pass or concurrent page requests per HTTP worker. The HTTP stage warns below the validated starting point of 32. |
 | `max_num_seqs` | int | `64` | Maximum concurrent vLLM sequences. |
@@ -335,7 +336,7 @@ Common tuning controls include:
 
 ### Ray Data Fanout
 
-`PDFPartitioningStage` is a Ray Data fanout stage. It reads the manifest on one worker, emits one `FileGroupTask` per `pdfs_per_task` group, and Ray Data repartitions the result to one emitted task per block. Downstream preprocess and inference stages can then consume those blocks in parallel instead of receiving the whole manifest as one block.
+`PDFPartitioningStage` is a Ray Data fanout stage. By default, it reads the manifest on one worker, emits one `FileGroupTask` per `pdfs_per_task` group, and Ray Data repartitions the result to one emitted task per block. Downstream preprocess and inference stages can then consume those blocks in parallel instead of receiving the whole manifest as one block.
 
 This behavior is automatic with `RayDataExecutor`; no stage-spec override is required. `pdfs_per_task` still controls the work in each emitted task:
 
@@ -711,10 +712,36 @@ mount yourself. For a multi-node pipeline, the output directory must refer to th
 same shared storage at the same absolute path on every node running a writer and
 on the driver performing final validation. A node-local disk on each worker does
 not satisfy this requirement. Input and model/template paths must likewise be
-available on the nodes that read or serve them. Document regrouping remains a
+available on the nodes that read or serve them. By default, document regrouping is a
 global barrier, and planning, inventory validation, and final results are materialized in memory. Size the
 workload and driver for these requirements; a page budget does not bound total
 pipeline memory or make regrouping checkpoint-resumable.
+
+### Stream Page Tasks
+
+To enable streaming, add `--overlap-rendering --stream-page-tasks` to the
+[page-based command](#page-based-tasking). The CLI enables streaming for both
+the reader and final readback. When assembling the pipeline in Python, set
+`overlap_rendering=True` and `stream_page_tasks=True` on `NemotronParsePDFReader`,
+and `stream_page_tasks=True` on `PDFPageBudgetValidationStage`.
+This requires served single-pass Parse 3.5, Ray Data, and 1–64 pages per task.
+PDFium process reuse and [PNG reuse](#reuse-rendered-png-bytes) each have their own option.
+
+1. When the reader starts the pipeline with its default partitioner, the driver
+   packs pages in manifest order, one task per input block. The order uses no
+   previous render times. Custom partitioning workers keep their configured placement.
+2. Each overlap worker can render its next assigned task while its current HTTP
+   requests finish. Both tasks share the worker's rendered-input allowance.
+   Each inference request still contains one page.
+3. One merge actor reads the manifest, holds incomplete PDFs in memory, and
+   releases each document when its last range arrives. The standard Parquet
+   writer can publish it in that actor when their resource and environment
+   settings allow. If the actor fails, the run fails with it. Rerun the
+   manifest in a fresh output directory.
+4. After publication, the driver reconciles every output with the manifest.
+   Ray workers on the driver's node can help reread the files. The driver uses
+   a worker's result only if it can open the same file and verify its identity.
+   Otherwise, it rereads the file itself.
 
 ### Select a Page Subset
 
@@ -781,7 +808,8 @@ Completed ranges are encoded before admission, and the actor retains parsed
 pages until the parent completes. For large rasters, reduce the page budget or
 use a smaller raster cap to stay within the actor's 256 MiB held-result limit.
 The benchmark reports pipeline throughput for the overlapped path. The
-overlapped stage timer includes rendering as well as inference.
+overlapped stage timer includes rendering as well as inference. With streaming,
+rendering performed during the preceding task counts toward pipeline wall time.
 
 ## Benchmarking
 
