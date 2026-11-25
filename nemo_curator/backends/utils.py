@@ -129,6 +129,7 @@ class RayStageSpecKeys(str, Enum):
     IS_ACTOR_STAGE = "is_actor_stage"
     IS_FANOUT_STAGE = "is_fanout_stage"
     GROUP_BY_METADATA = "group_by_metadata"
+    STREAMING_FAN_IN = "streaming_fan_in"
     RUN_ON_DRIVER = "run_on_driver"
     IS_RAFT_ACTOR = "is_raft_actor"
     USE_TASK_WEIGHTS = "use_task_weights"
@@ -140,6 +141,7 @@ class RayStageSpecKeys(str, Enum):
     INITIAL_WORKERS = "initial_workers"
     RAY_REMOTE_ARGS = "ray_remote_args"
     RAY_NUM_CPUS = "ray_num_cpus"
+    TASK_LOOKAHEAD = "task_lookahead"
 
 
 ACTOR_POOL_SIZING_KEYS = (

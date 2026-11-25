@@ -14,13 +14,35 @@
 
 """Validate opt-in served reader configuration."""
 
-import pytest
+import base64
+import io
+import json
+import os
+import time
+from collections import Counter
+from dataclasses import asdict
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
 
+import pyarrow.parquet as pq
+import pytest
+from PIL import Image
+
+from nemo_curator.backends.ray_data import RayDataExecutor
+from nemo_curator.pipeline import Pipeline
+from nemo_curator.stages.interleaved.io import InterleavedParquetWriterStage
+from nemo_curator.stages.interleaved.pdf.nemotron_parse import inference
 from nemo_curator.stages.interleaved.pdf.nemotron_parse._early_admission import EarlyAdmissionStage
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.composite import NemotronParsePDFReader
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.extraction import parser_package_identity
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import DEFAULT_MODEL_PATH
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import output_version
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.schema import PAGE_OUTPUT_SCHEMA
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.validation import PDFPageBudgetValidationStage
 from nemo_curator.stages.resources import Resources
-from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG
+from nemo_curator.tasks.utils import TaskPerfUtils
+from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG, write_manifest
+from tests.stages.interleaved.pdf.nemotron_parse.test_inference import http_endpoint  # noqa: F401 - pytest fixture
 
 
 def test_served_options_do_not_rebind_existing_positional_endpoint():
@@ -147,6 +169,7 @@ def test_page_budget_keeps_http_capacity_and_adds_nonresumable_merge():
 def test_legacy_postprocess_graph_does_not_gain_a_fanout_boundary():
     reader = NemotronParsePDFReader(manifest_path="input.jsonl")
     assert reader._postprocessor.ray_stage_spec() == {"is_fanout_stage": False}
+    assert "run_on_driver" not in reader.decompose_and_apply_with()[0].ray_stage_spec()
 
 
 def test_ignored_legacy_controls_do_not_change_page_mode_output_version():
@@ -163,8 +186,6 @@ def test_ignored_legacy_controls_do_not_change_page_mode_output_version():
 
 
 def test_page_budget_rejects_other_executors_before_processing():
-    from nemo_curator.pipeline import Pipeline
-
     pipeline = Pipeline(name="wrong_backend")
     pipeline.add_stage(
         NemotronParsePDFReader(
@@ -222,6 +243,22 @@ def test_overlap_keeps_page_tasking_and_inference_worker_settings() -> None:
     assert overlap.renderer.persistent_rendering
 
 
+def test_repetition_detection_reaches_the_http_stage_and_requires_page_mode() -> None:
+    served = {
+        "manifest_path": "manifest.jsonl",
+        "parse_mode": "single",
+        "inference_server_endpoint": "http://served/v1",
+    }
+    page_mode = {**served, "pages_per_task": 64, "page_budget_extraction_config": TEST_EXTRACTION_CONFIG}
+
+    assert NemotronParsePDFReader(**page_mode)._inference.repetition_detection is None
+    reader = NemotronParsePDFReader(**page_mode, inference_server_repetition_detection=(128, 200))
+    assert reader._inference.repetition_detection == (128, 200)
+    for unrecorded in ({"manifest_path": "manifest.jsonl"}, served):
+        with pytest.raises(ValueError, match="Repetition detection requires served Parse"):
+            NemotronParsePDFReader(**unrecorded, inference_server_repetition_detection=(128, 200))
+
+
 def test_custom_raster_cap_requires_matching_extraction_identity() -> None:
     with pytest.raises(ValueError, match="does not match rendering settings"):
         NemotronParsePDFReader(
@@ -232,3 +269,133 @@ def test_custom_raster_cap_requires_matching_extraction_identity() -> None:
             page_budget_extraction_config=TEST_EXTRACTION_CONFIG,
             raster_max_size=(1024, 1024),
         )
+
+
+@pytest.mark.usefixtures("shared_ray_client")
+def test_real_ray_overlap_publishes_the_same_pages_as_separate_stages(
+    tmp_path: Path,
+    parse_package: ModuleType,
+    http_endpoint: SimpleNamespace,  # noqa: F811
+) -> None:
+    pytest.importorskip("pypdfium2")
+    pages = {"short.pdf": 3, "long.pdf": 9, "absent.pdf": 2, "refused.pdf": 4}
+    # Every page is one solid colour, so a request and its answer name the page they belong to.
+    cells = {
+        (name, page): (index + 1, page % 6 + 1, page // 6 + 1)
+        for index, (name, count) in enumerate(pages.items())
+        for page in range(count)
+    }
+    failures = {
+        ("absent.pdf", 0): "PDFError",
+        ("absent.pdf", 1): "PDFError",
+        ("refused.pdf", 2): "BadRequestError",
+    }
+    served = []
+
+    def respond(image_url: str) -> tuple[int, str]:
+        with Image.open(io.BytesIO(base64.b64decode(image_url.split(",", 1)[1]))) as image:
+            cell = tuple(round(value / 32) for value in image.convert("RGB").getpixel((0, 0)))
+        served.append(cell)
+        # A parent stays open long enough for the actor to render the task after it.
+        time.sleep(0.3)
+        status = 400 if cell == cells["refused.pdf", 2] else 200
+        return status, "<x_0.1><y_0.1>CELL-{}-{}-{}<x_0.9><y_0.9><class_Text>".format(*cell)
+
+    http_endpoint.respond = respond
+    for name, count in pages.items():
+        if name != "absent.pdf":
+            images = [
+                Image.new("RGB", (200, 260), tuple(32 * value for value in cells[name, page])) for page in range(count)
+            ]
+            images[0].save(tmp_path / name, save_all=True, append_images=images[1:])
+    manifest = write_manifest(tmp_path, [{"file_name": name, "num_pages": count} for name, count in pages.items()])
+    generation = inference._server_generation_config(
+        {**asdict(parse_package.GenerationSettings()), "skip_special_tokens": False}
+    )
+    config = {
+        **TEST_EXTRACTION_CONFIG,
+        "parser": parser_package_identity(),
+        "request": {
+            "model": "served",
+            "stage": "fullpage",
+            "prompt": parse_package.PROMPT,
+            "generation": asdict(generation),
+        },
+    }
+    published, requests, rendered_ahead = {}, {}, {}
+    for arm, options in {
+        "separate": {},
+        "overlap": {"overlap_rendering": True},
+        "streaming": {"overlap_rendering": True, "stream_page_tasks": True},
+        "streaming_persistent_reuse": {
+            "stream_page_tasks": True,
+            "overlap_rendering": True,
+            "persistent_rendering": True,
+            "inference_server_reuse_encoded_images": True,
+        },
+    }.items():
+        start = len(http_endpoint.requests)
+        reader = NemotronParsePDFReader(
+            manifest_path=str(manifest),
+            pdf_dir=str(tmp_path),
+            parse_mode="single",
+            pages_per_task=4,
+            page_budget_extraction_config=config,
+            inference_server_endpoint=http_endpoint.endpoint,
+            inference_server_model_name="served",
+            inference_server_client_num_workers=1,
+            **options,
+        )
+        # Ray workers import the parser package from the driver's path.
+        overrides = {"runtime_env": {"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}}}
+        reader.with_({reader._inference.name: overrides})
+        pipeline = Pipeline(
+            name=arm,
+            stages=[
+                reader,
+                InterleavedParquetWriterStage(
+                    path=str(tmp_path / arm),
+                    materialize_on_write=False,
+                    on_materialize_error="warn",
+                    schema=PAGE_OUTPUT_SCHEMA,
+                    reject_unknown_columns=True,
+                    atomic_local_write=True,
+                    use_output_file_id=True,
+                    mode="error",
+                ),
+                PDFPageBudgetValidationStage(
+                    manifest_path=str(manifest),
+                    expected_output_version=output_version({"pdf_extraction_config": config}),
+                    stream_page_tasks=reader.stream_page_tasks,
+                ),
+            ],
+        )
+        tasks = pipeline.run(RayDataExecutor())
+        assert any(isinstance(stage, EarlyAdmissionStage) for stage in pipeline.stages) is bool(options)
+        validation = tasks[0]._metadata["pdf_page_budget_validation"]
+        assert (validation["documents"], validation["successful_pages"], validation["failed_pages"]) == (4, 15, 3)
+        rows = [row for task in tasks for path in task.data for row in pq.read_table(path).to_pylist()]
+        page_rows = {(row["pdf_name"], row["page_number"]): row for row in rows if row["page_number"] is not None}
+        assert len(page_rows) == sum(row["page_number"] is not None for row in rows) == len(cells)
+        for page, row in page_rows.items():
+            if page in failures:
+                assert json.loads(row["materialize_error"])["type"] == failures[page]
+            else:
+                assert not row["materialize_error"]
+                assert "CELL-{}-{}-{}".format(*cells[page]) in row["text_content"]
+        assert Counter(served[start:]) == Counter(cell for page, cell in cells.items() if page[0] != "absent.pdf")
+        requests[arm] = Counter(json.dumps(body, sort_keys=True) for body in http_endpoint.requests[start:])
+        published[arm] = sorted(rows, key=lambda row: (row["pdf_name"], row["position"]))
+        rendered_ahead[arm] = TaskPerfUtils.aggregate_task_metrics(tasks).get(
+            f"{reader._inference.name}_custom.render_ahead_pages_sum"
+        )
+    request = http_endpoint.requests[0]
+    assert request["model"] == "served"
+    assert request["messages"][0]["content"][0]["text"] == parse_package.PROMPT
+    for arm in ("overlap", "streaming", "streaming_persistent_reuse"):
+        assert requests[arm] == requests["separate"]
+        assert published[arm] == published["separate"]
+    # Ray Data hands the actor its next task early only when the stage asks for it.
+    assert rendered_ahead["separate"] is None
+    assert not rendered_ahead["overlap"]
+    assert min(rendered_ahead["streaming"], rendered_ahead["streaming_persistent_reuse"]) > 0

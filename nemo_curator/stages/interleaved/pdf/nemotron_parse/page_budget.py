@@ -7,7 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 PAGE_BUDGET_SCHEMA = "pdf-page-budget.v1"
 EXTRACTION_CONFIG_SCHEMA = "pdf-page-extraction.v1"
@@ -94,6 +98,36 @@ def selected_pages(entry: dict[str, Any]) -> list[int]:
         msg = f"Page budgeting requires num_pages or selected_page_indices for {entry.get('file_name')!r}"
         raise ValueError(msg)
     return list(range(count))
+
+
+def iter_manifest_documents(
+    manifest_path: str, max_pdfs: int | None, file_name_field: str
+) -> Iterator[dict[str, Any]]:
+    """Yield admitted identities without materializing every document's page selection."""
+    seen, samples = set(), set()
+    with open(manifest_path) as manifest:
+        for line in manifest:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            identity = document_identity(entry)
+            key = identity["document_id"]
+            sample = entry[file_name_field].rsplit(".", 1)[0]
+            if key in seen or sample in samples:
+                msg = "Duplicate document or ambiguous sample_id in expected inventory"
+                raise ValueError(msg)
+            seen.add(key)
+            samples.add(sample)
+            yield {**identity, "entry": entry, "sample": sample}
+            if max_pdfs is not None and len(seen) == max_pdfs:
+                break
+
+
+def output_inventory_scope(
+    manifest_path: str, max_pdfs: int | None, file_name_field: str
+) -> tuple[str, str, int | None, str]:
+    """Identify the finalizer for the same manifest selection."""
+    return ("pdf_page_budget_validation", str(Path(manifest_path).resolve()), max_pdfs, file_name_field)
 
 
 def validate_chunk_pages(chunk: dict[str, Any], pages: list[dict[str, Any]]) -> None:

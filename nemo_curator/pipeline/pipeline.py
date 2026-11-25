@@ -29,7 +29,9 @@ def _requires_ray_data(stage: ProcessingStage) -> bool:
     if not isinstance(spec, Mapping):
         return False
     group_key = spec.get(RayStageSpecKeys.GROUP_BY_METADATA)
-    return (isinstance(group_key, str) and bool(group_key)) or spec.get(RayStageSpecKeys.RUN_ON_DRIVER) is True
+    return (isinstance(group_key, str) and bool(group_key)) or any(
+        spec.get(key) is True for key in (RayStageSpecKeys.STREAMING_FAN_IN, RayStageSpecKeys.RUN_ON_DRIVER)
+    )
 
 
 def _append_input_requirements(lines: list[str], input_specs: StageInputSpecs) -> None:

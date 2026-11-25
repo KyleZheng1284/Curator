@@ -310,9 +310,13 @@ only when the Curator API has no equivalent, and set them before pipeline execut
 | Actor startup size | `stage.with_(ray_stage_spec={RayStageSpecKeys.INITIAL_WORKERS: N})` | Startup target only; does not retain actors above `MIN_WORKERS` |
 | Force actor or task | `stage.with_(ray_stage_spec={RayStageSpecKeys.IS_ACTOR_STAGE: bool})` | Overrides adapter selection |
 | Actor task-envelope concurrency | `stage.with_(ray_stage_spec={RayStageSpecKeys.RAY_REMOTE_ARGS: {"max_concurrency": N}})` | Overlaps actor task envelopes; the UDF remains serialized by default |
+| Prepare an actor's next task early | `RayStageSpecKeys.TASK_LOOKAHEAD` on an actor with `lookahead(tasks)` | Prepare work as it arrives. Processing calls remain serial, so `lookahead()` must return without waiting for them. |
 | CPU/GPU request | `stage.with_(resources=Resources(cpus=N, gpus=M))` | Per-worker resources used in scheduling and budgets |
 | Ray-only CPU override | `stage.with_(ray_stage_spec={RayStageSpecKeys.RAY_NUM_CPUS: N})` | Changes Ray Data resource accounting without changing other backends |
 | Recycle task workers | `stage.with_(ray_stage_spec={RayStageSpecKeys.MAX_CALLS_PER_WORKER: N})` | Passed as `max_calls` for task stages |
+
+For driver finalizers, streaming fan-in and writer placement, see the
+[Ray Data execution reference](../../../fern/versions/main/pages/reference/infrastructure/execution-backends.mdx#grouped-tasks-and-driver-finalizers).
 
 ### Client and global controls
 

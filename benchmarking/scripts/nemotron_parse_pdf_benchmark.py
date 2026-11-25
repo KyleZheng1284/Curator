@@ -194,6 +194,9 @@ def _log_benchmark_result(duration: float, num_pdfs: int, metrics: dict[str, flo
 
 def _benchmark_server_type(args: argparse.Namespace) -> InferenceServerBackend | None:
     server_type = args.inference_server_type
+    if getattr(args, "repetition_detection", None) is not None and args.inference_server_endpoint is None:
+        msg = "--repetition-detection requires an external vLLM --inference-server-endpoint"
+        raise ValueError(msg)
     if args.inference_server_endpoint is not None and server_type is not None:
         msg = "Choose --inference-server-endpoint or --inference-server-type, not both"
         raise ValueError(msg)
@@ -366,6 +369,8 @@ def run_nemotron_parse_pdf_benchmark(args: argparse.Namespace) -> dict[str, Any]
             "raster_max_size": getattr(args, "raster_max_size", None),
             "persistent_rendering": getattr(args, "persistent_rendering", False),
             "overlap_rendering": overlap_rendering,
+            "stream_page_tasks": getattr(args, "stream_page_tasks", False),
+            "repetition_detection": getattr(args, "repetition_detection", None),
             "max_pages": args.max_pages,
             "inference_batch_size": args.inference_batch_size,
             "max_num_seqs": (

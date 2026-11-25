@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import copy
+import threading
 from collections.abc import Callable
 from typing import Any
 
@@ -49,6 +50,7 @@ class RayDataStageAdapter(BaseStageAdapter):
     def __init__(self, stage: ProcessingStage, ignore_head_node: bool = False):
         super().__init__(stage)
         self.ignore_head_node = ignore_head_node
+        self._fused_stage: ProcessingStage | None = None
 
         self._batch_size = self.stage.batch_size
         if self._batch_size is None and self.stage.resources.gpus > 0:
@@ -110,6 +112,32 @@ class RayDataStageAdapter(BaseStageAdapter):
             raise ValueError(msg)
         return get_num_workers_for_nodes(num_workers_per_node, node_count, self.stage.name)
 
+    def fuse_next_stage(self, following: ProcessingStage) -> bool:
+        """Share the fan-in actor only when both stages declare support and keep default worker options."""
+        if (
+            _allows_fan_in_fusion(self.stage)
+            and _allows_fan_in_fusion(following)
+            and self.stage.ray_stage_spec() == {RayStageSpecKeys.STREAMING_FAN_IN: True}
+            and following.ray_stage_spec() == {RayStageSpecKeys.IS_FANOUT_STAGE: False}
+            and not is_actor_stage(following)
+        ):
+            logger.info(f"Stage {following.name} runs inside the {self.stage.name} actor")
+            self._fused_stage = following
+            return True
+        return False
+
+    def _actor_pool_kwargs(self, ray_stage_spec: dict, total_pool_size: int | None) -> dict[str, Any]:
+        if ray_stage_spec.get(RayStageSpecKeys.STREAMING_FAN_IN):
+            retry_options = ray_stage_spec.get(RayStageSpecKeys.RAY_REMOTE_ARGS) or {}
+            if any(retry_options.get(key, 0) != 0 for key in ("max_restarts", "max_task_retries")):
+                msg = f"Streaming fan-in stage {self.stage.name} requires max_restarts=0 and max_task_retries=0."
+                raise ValueError(msg)
+            # One actor has to see every task. Losing its in-memory state fails the run.
+            return {"compute": ActorPoolStrategy(size=1), "max_restarts": 0, "max_task_retries": 0}
+        if total_pool_size is not None:
+            return {"compute": ActorPoolStrategy(size=total_pool_size)}
+        return {"compute": get_actor_compute_strategy_for_stage(self.stage)}
+
     def process_dataset(self, dataset: Dataset) -> Dataset:
         """Process a Ray Data dataset through this stage.
 
@@ -120,17 +148,17 @@ class RayDataStageAdapter(BaseStageAdapter):
             Dataset: Processed Ray Data dataset
         """
         ray_stage_spec = self.stage.ray_stage_spec()
-        stage_is_actor = ray_stage_spec.get(RayStageSpecKeys.IS_ACTOR_STAGE, is_actor_stage(self.stage))
+        stage_is_actor = ray_stage_spec.get(RayStageSpecKeys.STREAMING_FAN_IN) or ray_stage_spec.get(
+            RayStageSpecKeys.IS_ACTOR_STAGE, is_actor_stage(self.stage)
+        )
         total_pool_size = self._total_pool_size()
 
+        _validate_task_lookahead(self.stage, ray_stage_spec, stage_is_actor)
+
         if stage_is_actor:
-            map_batches_fn = create_actor_from_stage(self.stage)
-            compute = (
-                ActorPoolStrategy(size=total_pool_size)
-                if total_pool_size is not None
-                else get_actor_compute_strategy_for_stage(self.stage)
-            )
-            map_batches_kwargs = {"compute": compute}
+            map_batches_fn = create_actor_from_stage(self.stage, self._fused_stage)
+            map_batches_kwargs = self._actor_pool_kwargs(ray_stage_spec, total_pool_size)
+            map_batches_kwargs.update(_task_lookahead_kwargs(ray_stage_spec, map_batches_kwargs["compute"], dataset))
         else:
             map_batches_fn = create_task_from_stage(self.stage)
             map_batches_kwargs = {}
@@ -188,6 +216,43 @@ class RayDataStageAdapter(BaseStageAdapter):
         return processed_dataset
 
 
+def _allows_fan_in_fusion(stage: ProcessingStage) -> bool:
+    # A subclass can change worker setup or side effects. Only its own declaration opts it in.
+    return (
+        vars(type(stage)).get("_supports_fan_in_fusion", False)
+        and not stage.runtime_env
+        and stage.resources == ProcessingStage.resources
+        and stage.batch_size == 1
+        and stage.num_workers() is None
+        and get_stage_num_workers_per_node(stage) is None
+    )
+
+
+def _validate_task_lookahead(stage: ProcessingStage, spec: dict, is_actor: bool) -> None:
+    if not spec.get(RayStageSpecKeys.TASK_LOOKAHEAD):
+        return
+    if not is_actor or not callable(getattr(stage, "lookahead", None)):
+        msg = f"task_lookahead requires an actor stage with a callable lookahead method: {stage.name}."
+        raise ValueError(msg)
+    if "max_concurrency" in (spec.get(RayStageSpecKeys.RAY_REMOTE_ARGS) or {}):
+        msg = f"ray_remote_args cannot override max_concurrency for task_lookahead stage {stage.name}."
+        raise ValueError(msg)
+
+
+def _task_lookahead_kwargs(ray_stage_spec: dict, compute: ActorPoolStrategy, dataset: Dataset) -> dict[str, int]:
+    """Let an actor's next task reach a stage that asks for it while the current task runs."""
+    if not ray_stage_spec.get(RayStageSpecKeys.TASK_LOOKAHEAD):
+        return {}
+    # Ray Data serializes an actor's calls by keeping the second task from the stage. The actor
+    # adapter serializes them itself, after showing the stage that task.
+    compute.enable_true_multi_threading = True
+    if compute.min_size == compute.max_size:
+        # A fixed pool keeps the default two tasks on each actor: the running one and the next.
+        # An autoscaling pool needs Ray Data's larger default to reach its scale-up threshold.
+        compute.max_tasks_in_flight_per_actor = dataset.context.max_tasks_in_flight_per_actor or 2
+    return {"max_concurrency": 2}
+
+
 def _process_metadata_groups(dataset: Dataset, key: str, fn: Callable, kwargs: dict) -> Dataset:
     if not isinstance(key, str) or not key:
         msg = "group_by_metadata must be a nonempty metadata key"
@@ -204,8 +269,13 @@ def _add_metadata_group_key(batch: dict[str, Any], *, key: str) -> dict[str, Any
     return {"item": batch["item"], "_curator_group_key": keys}
 
 
-def create_actor_from_stage(stage: ProcessingStage) -> type[RayDataStageAdapter]:
-    """Create a StageProcessor class with the proper stage name for display."""
+def create_actor_from_stage(
+    stage: ProcessingStage, fused_stage: ProcessingStage | None = None
+) -> type[RayDataStageAdapter]:
+    """Create a StageProcessor class with the proper stage name for display.
+
+    A fused task stage processes this stage's results in the same actor, through its own adapter.
+    """
 
     class RayDataStageActorAdapter(RayDataStageAdapter):
         """Simplified stateful processor that wraps a ProcessingStage for Ray Data."""
@@ -217,9 +287,36 @@ def create_actor_from_stage(stage: ProcessingStage) -> type[RayDataStageAdapter]
             node_info, worker_metadata = get_worker_metadata_and_node_id()
             self.setup_on_node(node_info, worker_metadata)
             self.setup(worker_metadata)
+            self._fused_adapter = None if fused_stage is None else BaseStageAdapter(fused_stage)
+            self._calls = None
+            if stage.ray_stage_spec().get(RayStageSpecKeys.TASK_LOOKAHEAD):
+                self._calls = threading.Condition()
+                self._arrived = self._served = 0
+
+        def _process_and_fuse(self, batch: dict[str, Any]) -> dict[str, Any]:
+            results = self._process_batch_internal(batch)
+            if self._fused_adapter is not None:
+                fused_results = []
+                for task in results["item"]:
+                    fused_results.extend(self._fused_adapter.process_batch([task]))
+                results["item"] = fused_results
+            return results
 
         def __call__(self, batch: dict[str, Any]) -> dict[str, Any]:
-            return self._process_batch_internal(batch)
+            if self._calls is None:
+                return self._process_and_fuse(batch)
+            # Accept the next task on arrival while keeping each processing call serialized.
+            with self._calls:
+                self.stage.lookahead(batch["item"])
+                turn = self._arrived
+                self._arrived += 1
+                self._calls.wait_for(lambda: self._served == turn)
+            try:
+                return self._process_and_fuse(batch)
+            finally:
+                with self._calls:
+                    self._served += 1
+                    self._calls.notify_all()
 
     # Set the class name to match the stage name
     stage_name = stage.__class__.__name__ + "Actor"

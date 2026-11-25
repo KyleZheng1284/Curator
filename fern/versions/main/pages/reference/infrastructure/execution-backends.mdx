@@ -208,12 +208,19 @@ Stages can opt into these Ray Data stage-spec keys through `ray_stage_spec()` or
 | `RayStageSpecKeys` member | Value | Behavior |
 | --- | --- | --- |
 | `GROUP_BY_METADATA` | `"group_by_metadata"` | Name a task metadata field containing a nonempty string. Ray Data groups tasks by that value and passes each complete group to `process_batch()`. |
+| `STREAMING_FAN_IN` | `"streaming_fan_in"` | Deliver incoming tasks to one stateful actor that can emit each completed result. |
+| `TASK_LOOKAHEAD` | `"task_lookahead"` | Call an actor stage's `lookahead(tasks)` as work arrives. Calls to `process_batch()` run serially in arrival order. |
 | `RUN_ON_DRIVER` | `"run_on_driver"` | Set to `True` to execute `process_batch()` once on the collected final task list, including an empty list. |
 
-Grouped stages introduce a global grouping barrier; they do not provide bounded
-streaming fan-in. Driver stages must form the final suffix after all distributed
-stages and run in order after results are collected. Allow driver memory for the
-result list and any finalizer inventory. On the driver, these stages call
+Grouped stages wait for upstream tasks to finish. A streaming fan-in actor can
+process arrivals immediately. Actor restarts and Ray task retries are disabled
+because pending inputs live in the actor. In the streaming PDF pipeline,
+the standard `InterleavedParquetWriterStage` can run in the merge actor
+when the writer's resources, worker sizing, and runtime environment are compatible.
+
+Stages marked `RUN_ON_DRIVER` must follow all distributed stages. They run
+in order after results are collected. Allow driver memory for the result list
+and any finalizer inventory. On the driver, these stages call
 `process_batch()` without `setup()` or `teardown()`. The executor still invokes
 `setup_on_node()` on Ray nodes, which does not initialize the driver instance.
 Driver processing must use its existing environment and initialize any required
@@ -223,8 +230,8 @@ A stage can declare `required_finalizer` to require a matching driver stage's
 `finalizes` identifier. The executor rejects a pipeline missing that finalizer
 before execution. For example, page-based PDF regrouping requires a final
 manifest-to-output reconciliation so an entirely missing document is detected.
-`Pipeline.run()` rejects other executors for pipelines using these grouped or
-driver-only stages. Calling an executor's `execute()` directly bypasses that
+`Pipeline.run()` rejects other executors for pipelines using these grouped,
+streaming fan-in, or driver-only stages. Calling an executor's `execute()` directly bypasses that
 pipeline-level compatibility check; it is not a supported way to run these stages
 on another backend. See [page-based PDF tasking](/main/curate-text/load-data/nemotron-parse-pdf#page-based-tasking)
 for the complete reader, writer, and validation workflow.

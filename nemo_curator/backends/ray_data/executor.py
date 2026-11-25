@@ -29,6 +29,32 @@ if TYPE_CHECKING:
     from nemo_curator.stages.base import ProcessingStage
 
 
+def _distributed_stage_range(stages: list["ProcessingStage"]) -> tuple[int, int]:
+    """Locate distributed work between an eligible source and trailing driver validation."""
+    on_driver = [bool(stage.ray_stage_spec().get(RayStageSpecKeys.RUN_ON_DRIVER)) for stage in stages]
+    last = on_driver.index(True) if True in on_driver else len(stages)
+    if not all(on_driver[last:]):
+        msg = "Driver validation stages must follow all distributed stages"
+        raise ValueError(msg)
+    # The source adapter expands one seed per block only when a distributed consumer follows.
+    first = 1 if last > 1 and getattr(stages[0], "_prefer_driver_as_source", False) else 0
+    return first, last
+
+
+def _process_leading_stage(stage: "ProcessingStage", tasks: list[Task]) -> list[Task]:
+    # from_items creates one task per block. Preserve the worker's batch boundaries so the
+    # adapter can attribute each fan-out result to the same input task on repeated runs.
+    batch_size = 1 if stage.batch_size is None else stage.batch_size
+    if batch_size < 1:
+        msg = "batch_size must be positive"
+        raise ValueError(msg)
+    adapter = BaseStageAdapter(stage)
+    expanded = []
+    for start in range(0, len(tasks), batch_size):
+        expanded.extend(adapter.process_batch(tasks[start : start + batch_size]))
+    return expanded
+
+
 class RayDataExecutor(BaseExecutor):
     """Ray Data-based executor for pipeline execution.
 
@@ -63,15 +89,13 @@ class RayDataExecutor(BaseExecutor):
         """
         if not stages:
             return []
-        driver_stages = [stage for stage in stages if stage.ray_stage_spec().get(RayStageSpecKeys.RUN_ON_DRIVER)]
-        driver_stage_ids = {id(stage) for stage in driver_stages}
-        if driver_stages and any(id(stage) not in driver_stage_ids for stage in stages[-len(driver_stages) :]):
-            msg = "Driver validation stages must follow all distributed stages"
-            raise ValueError(msg)
+        first, last = _distributed_stage_range(stages)
+        trailing_stages = stages[last:]
         required = {getattr(stage, "required_finalizer", None) for stage in stages} - {None}
-        present = {getattr(stage, "finalizes", None) for stage in driver_stages}
+        present = {getattr(stage, "finalizes", None) for stage in trailing_stages}
+        present.update(getattr(stage, "finalizes_scope", None) for stage in trailing_stages)
         if missing := required - present:
-            msg = f"Required final driver validation is missing: {sorted(missing)}"
+            msg = f"Required final driver validation is missing: {sorted(missing, key=str)}"
             raise ValueError(msg)
 
         diagnostics_status = install_ray_data_diagnostics()
@@ -96,6 +120,11 @@ class RayDataExecutor(BaseExecutor):
                 ignore_reinit_error=True, runtime_env={"env_vars": {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": ""}}
             )
 
+            # A leading driver stage expands the tasks before the dataset exists, so each task it emits
+            # starts as its own block and the plan needs no repartition operator after a fan-out.
+            if first:
+                tasks = _process_leading_stage(stages[0], tasks)
+
             # Convert tasks to dataset
             current_dataset = self._tasks_to_dataset(tasks)
 
@@ -104,15 +133,18 @@ class RayDataExecutor(BaseExecutor):
             logger.info(f"Setup on node complete for all stages. Starting Ray Data pipeline with {len(stages)} stages")
 
             # Process through each stage
-            for i, stage in enumerate(stages):
-                if id(stage) in driver_stage_ids:
-                    continue
+            index = first
+            while index < last:
+                stage = stages[index]
+                index += 1
                 # TODO: add pipeline level config for verbosity
-                logger.info(f"Processing stage {i + 1}/{len(stages)}: {stage}")
+                logger.info(f"Processing stage {index}/{len(stages)}: {stage}")
                 logger.info(f"  CPU cores: {stage.resources.cpus}, GPU ratio: {stage.resources.gpus}")
 
                 # Create adapter for this stage
                 adapter = RayDataStageAdapter(stage, ignore_head_node=self.ignore_head_node)
+                if index < last and adapter.fuse_next_stage(stages[index]):
+                    index += 1
 
                 # Apply stage transformation
                 current_dataset = adapter.process_dataset(current_dataset)
@@ -124,7 +156,7 @@ class RayDataExecutor(BaseExecutor):
             # TODO: add pipeline configuration to check if user wants to return last stages output to driver
             output_tasks = self._dataset_to_tasks(current_dataset)
             # Driver validation also sees an empty result set, which no map/group UDF can inspect.
-            for stage in driver_stages:
+            for stage in trailing_stages:
                 output_tasks = BaseStageAdapter(stage).process_batch(output_tasks)
             logger.info(f"Pipeline completed. Final results: {len(output_tasks)} tasks")
         finally:
@@ -141,8 +173,9 @@ class RayDataExecutor(BaseExecutor):
         Returns:
             Ray Data dataset containing Task objects directly
         """
-        # Create Ray Data dataset directly from Task objects
-        return ray.data.from_items(tasks, override_num_blocks=len(tasks))
+        # Create Ray Data dataset directly from Task objects. A leading driver stage can emit no task,
+        # and Ray Data rejects a request for zero blocks.
+        return ray.data.from_items(tasks, override_num_blocks=len(tasks) or None)
 
     def _dataset_to_tasks(self, dataset: Dataset) -> list[Task]:
         """Convert Ray Data dataset back to list of tasks.

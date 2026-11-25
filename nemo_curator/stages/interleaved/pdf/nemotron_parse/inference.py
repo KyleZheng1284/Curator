@@ -77,6 +77,27 @@ class _ActiveParseRequests:
     tasks: set[asyncio.Task] = field(default_factory=set)
     closed: bool = False
 
+    def cancel(self) -> None:
+        # New requests and active HTTP retries for this parser share its cancellation scope.
+        if not self.closed:
+            self.closed = True
+            for request in self.tasks:
+                request.cancel()
+
+    async def wait_for_parser(self, work: asyncio.Future) -> dict[str, Any]:
+        try:
+            # Cancelling an asyncio waiter cannot stop a parser thread.
+            return await asyncio.shield(work)
+        except asyncio.CancelledError:
+            self.cancel()
+            # Keep the request slot and the caller's PNG credit until the thread exits.
+            while not work.done():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.wait((work,))
+            if not work.cancelled():
+                work.exception()
+            raise
+
 
 _PARSE_ACTIVE_REQUESTS: ContextVar[_ActiveParseRequests | None] = ContextVar("active_parse_requests", default=None)
 _PARSE_TRANSPORT: ContextVar[tuple[AsyncOpenAIClient, asyncio.AbstractEventLoop]] = ContextVar("parse_transport")
@@ -103,6 +124,29 @@ def _server_generation_config(sampling_params: dict[str, Any]) -> GenerationConf
     config_params = {key: value for key, value in sampling_params.items() if key in _OPENAI_GENERATION_CONFIG_FIELDS}
     extra_body = {key: value for key, value in sampling_params.items() if key not in config_params}
     return GenerationConfig(**config_params, extra_kwargs={"extra_body": extra_body})
+
+
+RepetitionDetection = tuple[int, int] | tuple[int, int, int]
+_REPETITION_FIELDS = ("max_pattern_size", "min_count", "min_pattern_size")
+
+
+def _validate_repetition_detection(limits: Any, *, supported: bool) -> RepetitionDetection | None:  # noqa: ANN401
+    """Validate the maximum pattern size, repeat count, and optional minimum pattern size."""
+    if limits is None:
+        return None
+    if not supported:
+        msg = "Repetition detection requires served Parse 3.5 single mode, pages_per_task, and an admitted extraction configuration"
+        raise ValueError(msg)
+    # vLLM reads a maximum of zero as "off" and rejects a count below two.
+    if isinstance(limits, (tuple, list)) and len(limits) in (2, 3) and all(type(value) is int for value in limits):
+        max_pattern_size, min_count, *minimum = limits
+        if max_pattern_size >= 1 and min_count > 1 and (not minimum or 0 <= minimum[0] <= max_pattern_size):
+            return tuple(limits)
+    msg = (
+        "repetition_detection must be (max_pattern_size >= 1, min_count >= 2) "
+        "with an optional third integer 0 <= min_pattern_size <= max_pattern_size"
+    )
+    raise ValueError(msg)
 
 
 def set_nemotron_parse_attention_backend(engine_kwargs: dict[str, Any]) -> None:
@@ -467,6 +511,11 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     text_in_pic, task_prompt and max_tokens apply only to the legacy path.
     ``reuse_encoded_images`` reuses verified, unchanged producer PNGs in served
     single mode. It is disabled by default; unverified inputs are encoded normally.
+    ``repetition_detection`` is ``(max_pattern_size, min_count[, min_pattern_size])``,
+    sent as vLLM's field of that name; a page the server stops fails with finish
+    reason ``repetition``. Unset by default. It requires single mode, an
+    ``extraction_config`` that records it, and an endpoint whose ``/openapi.json``
+    declares the field.
     """
 
     endpoint: str
@@ -483,6 +532,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
     max_tokens: int = DEFAULT_MAX_TOKENS
     proc_size: tuple[int, int] = (2048, 1664)
     reuse_encoded_images: bool = field(default=False, kw_only=True)
+    repetition_detection: RepetitionDetection | None = field(default=None, kw_only=True)
 
     extraction_config: dict[str, Any] | None = field(default=None, kw_only=True)
     name: str = "nemotron_parse_inference"
@@ -495,6 +545,9 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         if self.reuse_encoded_images and self.parse_mode != "single":
             msg = "Encoded image reuse requires served Parse 3.5 single mode"
             raise ValueError(msg)
+        self.repetition_detection = _validate_repetition_detection(
+            self.repetition_detection, supported=self.parse_mode == "single"
+        )
         if self.parse_mode not in (None, "single", "double", "triple"):
             msg = "parse_mode must be single, double or triple"
             raise ValueError(msg)
@@ -526,6 +579,8 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         return {"is_actor_stage": self.parse_mode is not None}
 
     def setup(self, worker_metadata: dict | None = None) -> None:  # noqa: ARG002
+        # The admitted request is the only record of this setting in the output.
+        _validate_repetition_detection(self.repetition_detection, supported=self.extraction_config is not None)
         if self.parse_mode is not None:
             try:
                 from nemotron_parse.inference import DocumentParser
@@ -547,10 +602,25 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
                 }:
                     msg = "Admitted HTTP timeout/retry settings differ from this worker"
                     raise ExtractionConfigMismatchError(msg)
-                generation = _server_generation_config(
-                    {**asdict(self._parser.settings["fullpage"]), "skip_special_tokens": False}
-                )
+                generation = self._parse_generation_config(self._parser.settings["fullpage"])
                 self._check_extraction_request(PROMPT, "fullpage", generation)
+                if self.repetition_detection is not None:
+                    self._require_repetition_detection()
+
+    def _parse_generation_config(self, settings: Any) -> GenerationConfig:  # noqa: ANN401
+        sampling = {**asdict(settings), "skip_special_tokens": False}
+        if self.repetition_detection is not None:
+            limits = dict(zip(_REPETITION_FIELDS, self.repetition_detection, strict=False))
+            # vLLM checks the length cap first, and a zero or absent minimum pattern size means one token.
+            shortest_stop = (limits.get("min_pattern_size") or 1) * limits["min_count"]
+            if max(shortest_stop, limits["max_pattern_size"]) >= settings.max_tokens:
+                msg = (
+                    "repetition_detection needs max_pattern_size and min_pattern_size * min_count "
+                    f"below the parser limit of {settings.max_tokens} tokens"
+                )
+                raise ValueError(msg)
+            sampling["repetition_detection"] = limits
+        return _server_generation_config(sampling)
 
     def _check_extraction_request(self, prompt: str, stage: str, generation: GenerationConfig) -> None:
         if self.extraction_config is not None:
@@ -563,6 +633,30 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             if request != self.extraction_config["request"]:
                 msg = "Effective served request differs from admitted extraction configuration"
                 raise ExtractionConfigMismatchError(msg)
+
+    def _require_repetition_detection(self) -> None:
+        # A vLLM build without the field accepts and ignores it, so only its schema shows the guard is missing.
+        url = self.endpoint.rstrip("/").removesuffix("/v1") + "/openapi.json"
+        sent = _REPETITION_FIELDS[: len(self.repetition_detection)]
+        try:
+            with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310
+                spec = json.load(response)
+            body = spec["paths"]["/v1/chat/completions"]["post"]["requestBody"]
+            ref = body["content"]["application/json"]["schema"]["$ref"]
+            schemas = spec["components"]["schemas"]
+            properties = schemas[ref.removeprefix("#/components/schemas/")]["properties"]
+            field_schema = properties.get("repetition_detection", {})
+            for option in field_schema.get("anyOf", [field_schema]):
+                resolved = (
+                    schemas[option["$ref"].removeprefix("#/components/schemas/")] if "$ref" in option else option
+                )
+                if set(sent) <= resolved.get("properties", {}).keys():
+                    return
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            msg = f"Cannot verify repetition_detection in the external vLLM chat request schema at {url}: {exc}"
+            raise RuntimeError(msg) from exc
+        msg = f"The chat request schema at {url} does not declare repetition_detection with {', '.join(sent)}"
+        raise RuntimeError(msg)
 
     def _require_served_model(self) -> None:
         # Page failures become rows rather than raising, so an unusable endpoint must fail here.
@@ -612,7 +706,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             metrics[key] = metrics.get(key, 0) + 1
             if self.reuse_encoded_images and not reused:
                 metrics["image_reuse_fallback_count"] = metrics.get("image_reuse_fallback_count", 0) + 1
-        generation = _server_generation_config({**asdict(settings), "skip_special_tokens": False})
+        generation = self._parse_generation_config(settings)
         self._check_extraction_request(prompt, stage, generation)
         response = asyncio.run_coroutine_threadsafe(
             self._query_parse_page(
@@ -693,31 +787,37 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
         token = _PARSE_TRANSPORT.set((client, loop))
         semaphore = asyncio.Semaphore(self.inference_batch_size)
 
-        active = _ActiveParseRequests() if settle_on_cancel else None
-        request_token = _PARSE_ACTIVE_REQUESTS.set(active)
+        running: dict[asyncio.Future, _ActiveParseRequests] = {}
+        closed = False
 
         async def parse_page(row: dict[str, Any], reuse_encoded_images: bool) -> dict[str, Any]:
             if row.get("materialize_error"):
                 return {**row, "parse_document": None}
             async with semaphore:
-                return await loop.run_in_executor(
-                    parser_pool, copy_context().run, self._parse_page, row, reuse_encoded_images
-                )
+                if closed:
+                    raise asyncio.CancelledError
+                context = copy_context()
+                active = _ActiveParseRequests() if settle_on_cancel else None
+                context.run(_PARSE_ACTIVE_REQUESTS.set, active)
+                work = loop.run_in_executor(parser_pool, context.run, self._parse_page, row, reuse_encoded_images)
+                if active is None:
+                    return await work
+                running[work] = active
+                try:
+                    return await active.wait_for_parser(work)
+                finally:
+                    del running[work]
 
         try:
             yield parse_page
         finally:
-            if active is not None:
-                # Parser threads can submit work while their wrapper tasks get
-                # cancelled. Close that admission path before waiting for them.
-                active.closed = True
-                for task in active.tasks:
-                    task.cancel()
-                await asyncio.gather(*active.tasks, return_exceptions=True)
+            closed = True
+            if settle_on_cancel:
+                for active in running.values():
+                    active.cancel()
                 await asyncio.to_thread(parser_pool.shutdown, wait=True, cancel_futures=True)
             else:
                 parser_pool.shutdown(wait=False, cancel_futures=True)
-            _PARSE_ACTIVE_REQUESTS.reset(request_token)
             _PARSE_TRANSPORT.reset(token)
             if hasattr(client, "client"):
                 with contextlib.suppress(Exception):
@@ -771,6 +871,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             "num_failed_requests": sum("error" in request for request in requests),
             "total_prompt_tokens": sum(request.get("prompt_tokens", 0) for request in requests),
             "total_output_tokens": sum(request.get("completion_tokens", 0) for request in requests),
+            "repetition_stops": sum(request.get("finish_reason") == "repetition" for request in requests),
             **image_metrics,
         }
         return result
@@ -838,6 +939,7 @@ class NemotronParseHTTPClientStage(ProcessingStage[InterleavedBatch, Interleaved
             "num_failed_requests",
             "total_prompt_tokens",
             "total_output_tokens",
+            "repetition_stops",
             "image_reuse_count",
             "image_encode_count",
             "image_reuse_fallback_count",

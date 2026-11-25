@@ -25,6 +25,8 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import (
     DEFAULT_MODEL_PATH,
     NemotronParseHTTPClientStage,
     NemotronParseInferenceStage,
+    RepetitionDetection,
+    _validate_repetition_detection,
 )
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import validate_extraction_config
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import PDFPartitioningStage
@@ -78,6 +80,9 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     overlap_rendering
         Run HTTP inference as completed render ranges become available. Requires
         served single mode and a page budget of at most 64 pages.
+    stream_page_tasks
+        Stream tasks from the partitioner through document publication and validation.
+        Requires overlap_rendering.
     max_pages
         Legacy per-PDF page limit; page mode processes the full manifest selection.
     inference_batch_size
@@ -113,6 +118,12 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     inference_server_reuse_encoded_images
         Reuse verified unchanged producer PNGs in served single mode. Disabled
         by default; unverified images keep the ordinary encoding path.
+    inference_server_repetition_detection
+        ``(max_pattern_size, min_count[, min_pattern_size])``: ask vLLM to end a
+        generation that repeats a pattern ``min_count`` times. Such a page fails
+        with finish reason ``repetition``. Unset by default. Requires
+        pages_per_task, whose extraction configuration must record it, and an
+        external vLLM endpoint whose OpenAPI schema declares the field.
 
     page_budget_extraction_config
         Resolved effective parser, model, request, rendering and projection
@@ -134,6 +145,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     raster_max_size: tuple[int, int] = field(default=DEFAULT_RASTER_MAX_SIZE, kw_only=True)
     persistent_rendering: bool = field(default=False, kw_only=True)
     overlap_rendering: bool = field(default=False, kw_only=True)
+    stream_page_tasks: bool = field(default=False, kw_only=True)
     max_pages: int = 50
     inference_batch_size: int = 4
     max_num_seqs: int = 64
@@ -153,6 +165,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     inference_server_request_timeout_s: float = 300.0
     inference_server_max_retries: int = 3
     inference_server_reuse_encoded_images: bool = field(default=False, kw_only=True)
+    inference_server_repetition_detection: RepetitionDetection | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -165,6 +178,9 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         ):
             msg = "Encoded image reuse requires served Parse 3.5 single mode"
             raise ValueError(msg)
+        self.inference_server_repetition_detection = _validate_repetition_detection(
+            self.inference_server_repetition_detection, supported=self.pages_per_task is not None
+        )
         if self.manifest_path is None:
             msg = "manifest_path is required"
             raise ValueError(msg)
@@ -223,11 +239,20 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
                 inference_batch_size=self.inference_batch_size,
                 max_tokens=self.max_tokens,
                 reuse_encoded_images=self.inference_server_reuse_encoded_images,
+                repetition_detection=self.inference_server_repetition_detection,
             ).with_(num_workers=self.inference_server_client_num_workers)
         self._postprocessor = NemotronParsePostprocessStage(
             min_crop_px=self.min_crop_px,
         )
-        self._merger = PDFDocumentMergeStage() if self.pages_per_task is not None else None
+        self._merger = (
+            PDFDocumentMergeStage(
+                manifest_path=self.manifest_path if self.stream_page_tasks else None,
+                max_pdfs=self.max_pdfs,
+                file_name_field=self.file_name_field,
+            )
+            if self.pages_per_task is not None
+            else None
+        )
         if self._merger is not None:
             self._configure_page_budget()
 
@@ -235,6 +260,12 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         if type(self.overlap_rendering) is not bool:
             msg = "overlap_rendering must be a boolean"
             raise TypeError(msg)
+        if type(self.stream_page_tasks) is not bool:
+            msg = "stream_page_tasks must be a boolean"
+            raise TypeError(msg)
+        if self.stream_page_tasks and not self.overlap_rendering:
+            msg = "stream_page_tasks requires overlap_rendering"
+            raise ValueError(msg)
         if self.overlap_rendering and not (
             type(self.pages_per_task) is int and 1 <= self.pages_per_task <= _MAX_OVERLAP_PAGES
         ):
@@ -242,6 +273,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
             raise ValueError(msg)
 
     def _configure_page_budget(self) -> None:
+        self._partitioner._reader_source = self.stream_page_tasks
         self._inference.extraction_config = self.page_budget_extraction_config
         self._partitioner._extraction_config = self.page_budget_extraction_config
         self._preprocessor._extraction_config = self.page_budget_extraction_config
@@ -282,6 +314,10 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
 
     def decompose_and_apply_with(self) -> list[ProcessingStage]:
         stages = super().decompose_and_apply_with()
+        if self.stream_page_tasks and stages[0] is not self._partitioner:
+            # with_ returns a configured copy. Leave it to the regular worker adapter,
+            # which applies and validates caller-provided runtime and resource options.
+            stages[0]._reader_source = False
         if not self.overlap_rendering:
             return stages
 
@@ -314,7 +350,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         )
         if render_cpus is not None or infer_cpus is not None:
             ray_spec = {**ray_spec, "ray_num_cpus": cpus}
-        fused = EarlyAdmissionStage(renderer, inference).with_(
+        fused = EarlyAdmissionStage(renderer, inference, stream_page_tasks=self.stream_page_tasks).with_(
             name=inference.name,
             resources=Resources(cpus=cpus),
             batch_size=inference.batch_size,

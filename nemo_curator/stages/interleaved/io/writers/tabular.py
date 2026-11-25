@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from .base import BaseInterleavedWriter
 
@@ -29,6 +29,7 @@ class InterleavedParquetWriterStage(BaseInterleavedWriter):
 
     file_extension: str = "parquet"
     name: str = "interleaved_parquet_writer"
+    _supports_fan_in_fusion: ClassVar[bool] = True
 
     def _write_dataframe(self, df: pd.DataFrame, file_path: str, write_kwargs: dict[str, Any]) -> None:
         if self.reject_unknown_columns:

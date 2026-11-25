@@ -31,6 +31,10 @@ from nemo_curator.stages.resources import Resources
 from nemo_curator.tasks import EmptyTask, FileGroupTask
 
 
+def _partition_resources() -> Resources:
+    return Resources(cpus=0.5)
+
+
 @dataclass
 class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
     """Read a JSONL manifest and produce FileGroupTasks for downstream processing.
@@ -80,9 +84,22 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
     url_field: str = "url"
     pages_per_task: int | None = field(default=None, kw_only=True)
     name: str = "pdf_partitioning"
-    resources: Resources = field(default_factory=lambda: Resources(cpus=0.5))
+    resources: Resources = field(default_factory=_partition_resources)
     _parser_config: dict = field(default_factory=dict, init=False, repr=False)
     _extraction_config: dict = field(default_factory=dict, init=False, repr=False)
+    _reader_source: bool = field(default=False, init=False, repr=False)
+
+    @property
+    def _prefer_driver_as_source(self) -> bool:
+        # A caller may configure the expanded stage directly after the reader is built.
+        return (
+            self._reader_source
+            and not self.runtime_env
+            and self.resources == _partition_resources()
+            and self.num_workers() == 1
+            and self.num_workers_per_node() is None
+            and self.ray_stage_spec() == {"is_fanout_stage": True}
+        )
 
     def __post_init__(self) -> None:
         if self.pages_per_task is not None:
@@ -182,6 +199,7 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
             seen_ids.add(identity["document_id"])
             seen_samples.add(sample_id)
             indexes = selected_pages(entry)
+            selection_sha256 = identity_digest(indexes)
             offset = 0
             while offset < len(indexes):
                 if batch and batch_pages == self.pages_per_task:
@@ -195,7 +213,7 @@ class PDFPartitioningStage(ProcessingStage[EmptyTask, FileGroupTask]):
                     "sample_id": sample_id,
                     "offset": offset,
                     "total_pages": len(indexes),
-                    "selection_sha256": identity_digest(indexes),
+                    "selection_sha256": selection_sha256,
                     "page_indices": selected,
                 }
                 batch.append(json.dumps({**entry, "selected_page_indices": selected, "_page_chunk": chunk}))

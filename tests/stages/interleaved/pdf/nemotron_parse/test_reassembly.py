@@ -2,7 +2,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import copy
+import gc
 import json
+import weakref
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -32,14 +35,10 @@ def test_unordered_chunks_reconstruct_content_images_boxes_and_order(tmp_path: P
     assert all(row["document_id"] for row in rows)
 
 
-@pytest.mark.parametrize(
-    "mutation", ["missing_chunk", "duplicate_chunk", "wrong_page", "missing_content", "wrong_version"]
-)
+@pytest.mark.parametrize("mutation", ["duplicate_chunk", "wrong_page", "missing_content", "wrong_version"])
 def test_declared_chunk_counts_do_not_hide_corruption(tmp_path: Path, mutation: str):
     tasks = chunks(tmp_path)
-    if mutation == "missing_chunk":
-        tasks.pop()
-    elif mutation == "duplicate_chunk":
+    if mutation == "duplicate_chunk":
         tasks.append(copy.deepcopy(tasks[-1]))
     elif mutation == "wrong_version":
         tasks[-1]._metadata["pdf_chunk"]["source_version"] = "wrong-version"
@@ -100,9 +99,107 @@ def test_postprocessing_verifies_actual_physical_identity(tmp_path: Path, mutati
         NemotronParsePostprocessStage().process(batch)
 
 
-def test_merge_requires_grouped_ray_execution():
+def test_merge_requires_streaming_fan_in_execution():
+    assert PDFDocumentMergeStage().ray_stage_spec() == {"group_by_metadata": "pdf_document_id"}
+    assert PDFDocumentMergeStage(manifest_path="manifest.jsonl").ray_stage_spec() == {"streaming_fan_in": True}
     with pytest.raises(RuntimeError, match="RayDataExecutor"):
         PDFDocumentMergeStage().process(None)
+
+
+def _mixed_documents(tmp_path: Path) -> tuple[Path, list[InterleavedBatch], dict[str, InterleavedBatch]]:
+    """Ranges in task order for two single-range and two multi-range documents, and each whole document."""
+    entries = [
+        {"file_name": "short.pdf", "num_pages": 3},
+        {"file_name": "long.pdf", "num_pages": 11},
+        {"file_name": "tail.pdf", "num_pages": 2},
+        {"file_name": "wide.pdf", "num_pages": 7},
+    ]
+    manifest, tasks = partition(tmp_path, entries, 4)
+    _, unsplit = partition(tmp_path, entries, 64)
+    grouped = PDFDocumentMergeStage()
+    whole = [grouped.process_batch([chunk])[0] for chunk in project(unsplit[0], failed={2}, no_elements={5})]
+    return (
+        manifest,
+        [chunk for task in tasks for chunk in project(task, failed={2}, no_elements={5})],
+        {document._metadata["output_file_id"]: document for document in whole},
+    )
+
+
+@pytest.mark.parametrize("order", ["task_order", "reversed", "interleaved"])
+def test_ranges_arriving_one_at_a_time_in_any_order_match_whole_documents(tmp_path: Path, order: str):
+    manifest, ranges, whole = _mixed_documents(tmp_path)
+    arrivals = {"task_order": ranges, "reversed": ranges[::-1], "interleaved": ranges[1::2] + ranges[-2::-2]}[order]
+    assert len({id(arrival) for arrival in arrivals}) == len(ranges) > len(whole)
+    stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+    remaining = Counter(arrival._metadata["pdf_document_id"] for arrival in arrivals)
+    merged = {}
+    for arrival in arrivals:
+        document_id = arrival._metadata["pdf_document_id"]
+        remaining[document_id] -= 1
+        emitted = stage.process_batch([arrival])
+        # A document appears with its last range, never earlier and never partially.
+        assert len(emitted) == (remaining[document_id] == 0)
+        merged.update({document._metadata["output_file_id"]: document for document in emitted})
+    assert merged.keys() == whole.keys()
+    for output_id, document in merged.items():
+        assert document.data.equals(whole[output_id].data)
+        assert document._metadata == whole[output_id]._metadata
+
+
+def test_incomplete_document_is_never_emitted(tmp_path: Path):
+    manifest, tasks = partition(tmp_path, [{"file_name": "long.pdf", "num_pages": 130}])
+    stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+    ranges = [chunk for task in tasks for chunk in project(task)]
+    assert stage.process_batch(ranges[:-1]) == []
+    assert stage.process_batch([]) == []
+
+
+@pytest.mark.parametrize("arrival", ["while_held", "after_its_document_merged", "single_range_document"])
+def test_range_arriving_twice_is_rejected(tmp_path: Path, arrival: str):
+    if arrival == "single_range_document":
+        manifest, tasks = partition(tmp_path, [{"file_name": "a.pdf", "num_pages": 3}])
+        stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+        ranges = project(tasks[0])
+        assert len(stage.process_batch(copy.deepcopy(ranges))) == 1
+    else:
+        manifest, tasks = partition(tmp_path, [{"file_name": "long.pdf", "num_pages": 130}])
+        stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+        ranges = [chunk for task in tasks for chunk in project(task)]
+        delivered = ranges[:1] if arrival == "while_held" else ranges
+        assert len(stage.process_batch(copy.deepcopy(delivered))) == (arrival != "while_held")
+    with pytest.raises(ValueError, match="nonoverlapping ranges"):
+        stage.process_batch([ranges[0]])
+
+
+def test_single_range_documents_pass_straight_through(tmp_path: Path):
+    manifest, tasks = partition(tmp_path, [{"file_name": f"{index}.pdf", "num_pages": 2} for index in range(6)], 4)
+    stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+    for task in tasks:
+        for arrival in project(task):
+            (document,) = stage.process_batch([arrival])
+            assert json.loads(document.data["text_content"][0].as_py())["num_pages"] == 2
+            assert not stage._held
+
+
+def test_held_ranges_are_released_when_their_document_is_merged(tmp_path: Path):
+    manifest, ranges, _ = _mixed_documents(tmp_path)
+    stage = PDFDocumentMergeStage(manifest_path=str(manifest))
+    pages = Counter()
+    for arrival in ranges:
+        chunk = arrival._metadata["pdf_chunk"]
+        pages[chunk["document_id"]] += len(chunk["page_indices"])
+        if stage.process_batch([arrival]):
+            del pages[chunk["document_id"]]
+        # Only documents still waiting for a range are held, with exactly the ranges that have arrived.
+        assert {document_id: count for document_id, (count, _) in stage._held.items()} == pages
+        for count, held_ranges in stage._held.values():
+            assert count == sum(len(held._metadata["pdf_chunk"]["page_indices"]) for held in held_ranges.values())
+    assert not stage._held
+
+    first = weakref.ref(ranges[1])
+    del ranges, arrival
+    gc.collect()
+    assert first() is None
 
 
 @pytest.mark.parametrize("length", [0, 1, 3])

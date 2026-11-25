@@ -63,6 +63,7 @@ def served_models(monkeypatch: pytest.MonkeyPatch) -> None:
 class Settings:
     temperature: float = 0.0
     top_k: int = 1
+    max_tokens: int = 8744
 
 
 class StubParser:
@@ -486,13 +487,40 @@ def test_actual_parser_malformed_layout_retains_failure_and_successful_sibling()
 @pytest.fixture
 def http_endpoint():
     """Exercise real SDK sockets, response decoding, retries and keep-alive."""
-    state = SimpleNamespace(requests=[], peers=[], statuses=[], outputs={}, entered=threading.Event(), release=None)
+    state = SimpleNamespace(
+        requests=[], raw=[], peers=[], statuses=[], outputs={}, respond=None, entered=threading.Event(), release=None
+    )
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
         def do_GET(self) -> None:
-            payload = json.dumps({"data": [{"id": "served", "object": "model"}]}).encode()
+            if self.path == "/openapi.json":
+                schema = {"$ref": "#/components/schemas/ChatCompletionRequest"}
+                body = {"content": {"application/json": {"schema": schema}}}
+                value = {
+                    "paths": {"/v1/chat/completions": {"post": {"requestBody": body}}},
+                    "components": {
+                        "schemas": {
+                            "ChatCompletionRequest": {
+                                "properties": {
+                                    "repetition_detection": {
+                                        "anyOf": [
+                                            {"$ref": "#/components/schemas/RepetitionDetectionParams"},
+                                            {"type": "null"},
+                                        ]
+                                    }
+                                }
+                            },
+                            "RepetitionDetectionParams": {
+                                "properties": {"max_pattern_size": {}, "min_count": {}, "min_pattern_size": {}}
+                            },
+                        }
+                    },
+                }
+            else:
+                value = {"data": [{"id": "served", "object": "model"}]}
+            payload = json.dumps(value).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(payload)))
@@ -500,8 +528,10 @@ def http_endpoint():
             self.wfile.write(payload)
 
         def do_POST(self) -> None:
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            data = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(data)
             state.requests.append(body)
+            state.raw.append(data)
             state.peers.append(self.client_address)
             state.entered.set()
             if state.release is not None:
@@ -509,6 +539,8 @@ def http_endpoint():
             status = state.statuses.pop(0) if state.statuses else 200
             image_url = body["messages"][0]["content"][1]["image_url"]["url"]
             output, finish_reason = state.outputs.get(image_url, (TABLE, "stop"))
+            if state.respond is not None:
+                status, output = state.respond(image_url)
             response = (
                 {
                     "id": "test-completion",
@@ -792,6 +824,179 @@ def test_encoded_image_reuse_preserves_actual_sdk_retry_and_failure(http_endpoin
         assert client._custom_metrics["image_encode_count"] == 0
     finally:
         client.teardown()
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        (0, 200),
+        (-1, 200),
+        (128, 1),
+        (128, -2),
+        (128,),
+        (128, 200, 129),
+        (128, 200, -1),
+        (128, 200, 1.0),
+        (128, 200, True),
+        (4, 2, 1, 1),
+        (128.0, 200),
+        (True, 200),
+        "128:200",
+        128,
+    ],
+)
+def test_repetition_detection_rejects_settings_a_server_would_ignore_or_refuse(value: object):
+    with pytest.raises(ValueError, match="repetition_detection must be"):
+        _http_stage("http://unused/v1", repetition_detection=value)
+
+
+@pytest.mark.parametrize(
+    "limits", [(1, 8744), (8744, 2), (128, 8744, 0), (10**30, 10**30), (128, 200, 44), (4371, 3, 2915)]
+)
+def test_repetition_detection_respects_parser_output_budget(limits: tuple[int, ...]):
+    client = _http_stage("http://unused/v1", repetition_detection=limits)
+    with pytest.raises(ValueError, match="parser limit of 8744 tokens"):
+        client._parse_generation_config(Settings())
+
+
+@pytest.mark.parametrize(
+    "limits", [(1, 8743), (8743, 2), (128, 200), (128, 200, 0), (128, 200, 43), (43, 200, 43), (4371, 3, 2914)]
+)
+def test_repetition_detection_accepts_reachable_limits(limits: tuple[int, ...]):
+    client = _http_stage("http://unused/v1", repetition_detection=limits)
+    generation = client._parse_generation_config(Settings())
+    expected = {"max_pattern_size": limits[0], "min_count": limits[1]}
+    if len(limits) == 3:
+        expected["min_pattern_size"] = limits[2]
+    assert generation.extra_kwargs["extra_body"]["repetition_detection"] == expected
+
+
+def test_repetition_detection_requires_served_single_mode_with_an_admitted_request():
+    for mode in (None, "double", "triple"):
+        with pytest.raises(ValueError, match="Repetition detection requires served Parse"):
+            inference.NemotronParseHTTPClientStage(
+                endpoint="http://unused/v1", model_name="served", parse_mode=mode, repetition_detection=(128, 200)
+            )
+    stage = inference.NemotronParseHTTPClientStage(
+        endpoint="http://unused/v1", model_name="served", parse_mode="single", repetition_detection=[128, 200]
+    )
+    assert stage.repetition_detection == (128, 200)
+    with pytest.raises(ValueError, match="Repetition detection requires served Parse"):
+        stage.setup()
+
+
+def test_repetition_detection_adds_one_field_to_the_request_body_and_nothing_when_unset(
+    http_endpoint: SimpleNamespace,
+):
+    for setting in (None, (128, 200), (128, 200, 1), (128, 200, 8)):
+        client = _http_stage(http_endpoint.endpoint, repetition_detection=setting)
+        try:
+            client.process(task())
+        finally:
+            client.teardown()
+        assert client._custom_metrics["repetition_stops"] == 0
+
+    plain, guarded, explicit_one, explicit_eight = http_endpoint.raw
+    image_url = http_endpoint.requests[-1]["messages"][0]["content"][1]["image_url"]["url"]
+    client = _http_stage(http_endpoint.endpoint, repetition_detection=(128, 200))
+    try:
+        for reason, stops in (("length", 0), ("repetition", 1)):
+            http_endpoint.outputs[image_url] = (TABLE, reason)
+            client.process(task())
+            assert client._custom_metrics["repetition_stops"] == stops
+    finally:
+        client.teardown()
+    assert plain.endswith(b'"skip_special_tokens":false}')
+    assert guarded == plain[:-1] + b',"repetition_detection":{"max_pattern_size":128,"min_count":200}}'
+    assert explicit_one == guarded[:-2] + b',"min_pattern_size":1}}'
+    assert explicit_eight == guarded[:-2] + b',"min_pattern_size":8}}'
+
+
+@pytest.mark.parametrize(
+    "schema_case",
+    [
+        "missing-route",
+        "unrelated-schema",
+        "empty-field",
+        "only-max_pattern_size",
+        "only-min_count",
+        "boolean-field",
+        "properties-list",
+        "not-an-object",
+        "not-json",
+        "missing-schema",
+    ],
+)
+def test_repetition_detection_requires_the_chat_request_schema(monkeypatch: pytest.MonkeyPatch, schema_case: str):
+    stage = _http_stage("http://gateway/prefix/v1/", repetition_detection=(128, 200))
+    requested = []
+    body = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatRequest"}}}}
+    spec = {
+        "paths": {"/v1/chat/completions": {"post": {"requestBody": body}}},
+        "components": {
+            "schemas": {
+                "ChatRequest": {"properties": {}},
+                "UnusedRequest": {
+                    "properties": {"repetition_detection": {"properties": {"max_pattern_size": {}, "min_count": {}}}}
+                },
+            }
+        },
+    }
+    if schema_case == "missing-route":
+        spec["paths"].clear()
+    chat = spec["components"]["schemas"]["ChatRequest"]["properties"]
+    if schema_case == "empty-field":
+        chat["repetition_detection"] = {}
+    if schema_case.startswith("only-"):
+        chat["repetition_detection"] = {"properties": {schema_case.removeprefix("only-"): {}}}
+    if schema_case == "boolean-field":
+        chat["repetition_detection"] = True
+    if schema_case == "properties-list":
+        chat["repetition_detection"] = {"properties": ["max_pattern_size", "min_count"]}
+    if schema_case == "not-an-object":
+        spec = []
+
+    def get(url: str, **_kwargs) -> io.BytesIO:
+        requested.append(url)
+        if schema_case == "missing-schema":
+            msg = "schema unavailable"
+            raise OSError(msg)
+        return io.BytesIO(b"<html>" if schema_case == "not-json" else json.dumps(spec).encode())
+
+    monkeypatch.setattr(inference.urllib.request, "urlopen", get)
+    with pytest.raises(RuntimeError, match="repetition_detection"):
+        stage._require_repetition_detection()
+    assert requested == ["http://gateway/prefix/openapi.json"]
+
+
+def test_minimum_pattern_requires_the_nested_request_field(monkeypatch: pytest.MonkeyPatch):
+    body = {"content": {"application/json": {"schema": {"$ref": "#/components/schemas/ChatRequest"}}}}
+    old_params = {"properties": {"max_pattern_size": {}, "min_count": {}}}
+    spec = {
+        "paths": {"/v1/chat/completions": {"post": {"requestBody": body}}},
+        "components": {
+            "schemas": {
+                "ChatRequest": {
+                    "properties": {
+                        "repetition_detection": {"anyOf": [{"$ref": "#/components/schemas/Params"}, {"type": "null"}]}
+                    }
+                },
+                "Params": old_params,
+            }
+        },
+    }
+    monkeypatch.setattr(inference.urllib.request, "urlopen", lambda *_a, **_k: io.BytesIO(json.dumps(spec).encode()))
+    _http_stage("http://unused/v1", repetition_detection=(128, 200))._require_repetition_detection()
+    stage = _http_stage("http://unused/v1", repetition_detection=(128, 200, 8))
+    with pytest.raises(RuntimeError, match=r"does not declare repetition_detection with .*min_pattern_size"):
+        stage._require_repetition_detection()
+    old_params["properties"]["min_pattern_size"] = {"type": "integer"}
+    stage._require_repetition_detection()
+    declared = spec["components"]["schemas"]["ChatRequest"]["properties"]
+    reference = {"$ref": "#/components/schemas/Params"}
+    for shape in (reference, old_params, {"anyOf": [{"type": "null"}, reference]}):
+        declared["repetition_detection"] = shape
+        stage._require_repetition_detection()
 
 
 @pytest.mark.usefixtures("shared_ray_client")

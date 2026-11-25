@@ -98,6 +98,11 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         help="Submit completed render ranges while rendering continues in served page mode (up to 64 pages per task)",
     )
     parser.add_argument(
+        "--stream-page-tasks",
+        action="store_true",
+        help="Stream page tasks through document publication and validation (requires --overlap-rendering)",
+    )
+    parser.add_argument(
         "--max-pages",
         type=int,
         default=50,
@@ -148,6 +153,15 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reuse verified producer PNGs in served single mode; otherwise encode normally",
     )
+    parser.add_argument(
+        "--repetition-detection",
+        type=int,
+        nargs="+",
+        metavar="N",
+        help="MAX_PATTERN_SIZE MIN_COUNT [MIN_PATTERN_SIZE]. Stop a generation that repeats a pattern in this "
+        "range MIN_COUNT times. The page fails (requires an external vLLM --inference-server-endpoint, "
+        "--pages-per-task, and matching extraction config)",
+    )
 
     parser.add_argument("--file-name-field", default="file_name", help="JSONL field for single PDF filename")
     parser.add_argument(
@@ -172,6 +186,7 @@ def create_nemotron_parse_pdf_pipeline(
     serving GPU and start with ``args.inference_batch_size=32``. Tune request
     concurrency on the target hardware and corpus.
     """
+    stream_page_tasks = getattr(args, "stream_page_tasks", False)
     extraction_config = None
     if getattr(args, "pages_per_task", None) is not None:
         config_path = getattr(args, "page_budget_extraction_config", None)
@@ -199,6 +214,7 @@ def create_nemotron_parse_pdf_pipeline(
             raster_max_size=tuple(getattr(args, "raster_max_size", DEFAULT_RASTER_MAX_SIZE)),
             persistent_rendering=getattr(args, "persistent_rendering", False),
             overlap_rendering=getattr(args, "overlap_rendering", False),
+            stream_page_tasks=stream_page_tasks,
             max_pages=args.max_pages,
             inference_batch_size=args.inference_batch_size,
             max_num_seqs=args.max_num_seqs,
@@ -218,6 +234,7 @@ def create_nemotron_parse_pdf_pipeline(
             inference_server_request_timeout_s=getattr(args, "inference_server_request_timeout_s", 300.0),
             inference_server_max_retries=getattr(args, "inference_server_max_retries", 3),
             inference_server_reuse_encoded_images=getattr(args, "reuse_encoded_images", False),
+            inference_server_repetition_detection=getattr(args, "repetition_detection", None),
         )
     )
     pipeline.add_stage(
@@ -237,6 +254,7 @@ def create_nemotron_parse_pdf_pipeline(
             PDFPageBudgetValidationStage(
                 manifest_path=args.manifest,
                 expected_output_version=output_version({"pdf_extraction_config": extraction_config}),
+                stream_page_tasks=stream_page_tasks,
                 max_pdfs=args.max_pdfs,
                 file_name_field=args.file_name_field,
                 url_field=args.url_field,

@@ -92,6 +92,21 @@ def test_parse35_benchmark_requires_serving_configuration_before_gpu_probe(bench
     probe.assert_not_called()
 
 
+@pytest.mark.parametrize("server_type", [None, "dynamo", "ray-serve"])
+def test_managed_repetition_detection_is_rejected_before_startup(benchmark: tuple, server_type: str | None):
+    module, args, pipeline, _, server, factory, probe = benchmark
+    args.repetition_detection = [128, 200]
+    args.nemotron_parse_path = "parse-model"
+    args.inference_server_type = server_type
+    with pytest.raises(ValueError, match="external vLLM --inference-server-endpoint"):
+        module._benchmark_server_type(args)
+    assert not module.run_nemotron_parse_pdf_benchmark(args)["metrics"]["is_success"]
+    probe.assert_not_called()
+    factory.assert_not_called()
+    server.start.assert_not_called()
+    pipeline.run.assert_not_called()
+
+
 def test_external_endpoint_does_not_launch_or_stop_a_server(benchmark: tuple):
     module, args, pipeline, build, server, factory, probe = benchmark
     args.inference_server_endpoint = "http://native/v1"
@@ -102,10 +117,15 @@ def test_external_endpoint_does_not_launch_or_stop_a_server(benchmark: tuple):
     assert build.call_args.kwargs["inference_server_model_name"] == "served-name"
     assert build.call_args.kwargs["inference_server_client_num_workers"] == 4
     assert result["params"]["inference_server_endpoint"] == "http://native/v1"
+    assert result["params"]["repetition_detection"] is None
     pipeline.run.assert_called_once()
     factory.assert_not_called()
     probe.assert_not_called()
     server.stop.assert_not_called()
+
+    for limits in ([128, 200], [128, 200, 8]):
+        args.repetition_detection = limits
+        assert module.run_nemotron_parse_pdf_benchmark(args)["params"]["repetition_detection"] == limits
 
 
 @pytest.mark.parametrize(("replicas", "gpus"), [(None, 1), (1, None), (0, 1), (1, 0), (1, -1)])
@@ -132,6 +152,7 @@ def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
     args.num_replicas = 2
     args.inference_server_num_gpus = 1
     args.overlap_rendering = overlap_rendering
+    args.stream_page_tasks = overlap_rendering
     probe.return_value = client_gpus
     pipeline.run.return_value = [Mock()]
     monkeypatch.setattr(module, "_count_unique_pdfs", lambda _tasks: 1)
@@ -147,6 +168,7 @@ def test_remote_replicas_and_gpu_denominator_are_independent_of_client_hardware(
     result = module.run_nemotron_parse_pdf_benchmark(args)
     assert result["metrics"]["is_success"]
     assert result["params"]["num_replicas"] == 2
+    assert result["params"]["stream_page_tasks"] is overlap_rendering
     assert result["params"]["num_inference_gpus"] == 1
     assert build.call_args.kwargs["inference_server_client_num_workers"] == 8
     inference_rate = "inference_stage_pages_per_sec_per_gpu"

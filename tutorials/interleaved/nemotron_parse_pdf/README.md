@@ -224,6 +224,7 @@ images = [Image.open(io.BytesIO(b)) for b in df[df["modality"] == "image"]["bina
 | `--text-in-pic` | off | Predict text inside images (v1.2+ feature) |
 | `--nemotron-parse-path` | — | Complete local Parse 3.5 repository required for managed Dynamo in `main.py` or the benchmark |
 | `--reuse-encoded-images` | off | Reuse verified rendered PNG bytes for served Parse 3.5 `single` mode only |
+| `--repetition-detection MAX_PATTERN_SIZE MIN_COUNT [MIN_PATTERN_SIZE]` | off | Stop a repeated generation and retain the page as a failure. Use `--pages-per-task` and an external vLLM endpoint that declares the field in its OpenAPI schema. A gateway must forward it to every identically configured replica. The extraction config must record the same values. Both launchers reject this option unless `--inference-server-endpoint` is given. See [Stop Repeated Output](../../../fern/versions/main/pages/curate-text/load-data/nemotron-parse-pdf.mdx#stop-repeated-output). |
 
 ## Served Nemotron Parse 3.5
 
@@ -414,6 +415,12 @@ python tutorials/interleaved/nemotron_parse_pdf/main.py \
     --pages-per-task 64 --page-budget-extraction-config extraction.json
 ```
 
+To stream the same workload, append `--overlap-rendering --stream-page-tasks`.
+Workers can render the next assigned task while HTTP requests finish, and
+each complete PDF can reach the writer while other PDFs are still processing.
+Page packing follows manifest order. See [Stream Page Tasks](../../../fern/versions/main/pages/curate-text/load-data/nemotron-parse-pdf.mdx#stream-page-tasks)
+for placement, final readback and recovery.
+
 Use a fresh, locally addressed output directory for each run and verify its backing
 mount; a local filesystem API does not prove SSD storage or exclude NFS. On a
 multi-node cluster, every writer node and the validating driver must access the
@@ -435,8 +442,8 @@ wins. It is not crash durability, no-clobber publication, exactly-once inference
 or a multi-document transaction. Interrupted temporary files are retained. A run
 that raises during writing or final validation leaves already-published files;
 those files alone do not establish completion.
-Regrouping is a global barrier, with materialized planning/inventory/results and
-no regrouping checkpoint support; the page budget does not bound total memory.
+By default, regrouping is a global barrier. Both modes materialize planning,
+inventory and results in memory. Regrouping has no checkpoint support.
 
 ## Reproducing the Parse 3.5 serving benchmarks
 
