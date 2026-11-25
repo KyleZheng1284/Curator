@@ -224,6 +224,7 @@ images = [Image.open(io.BytesIO(b)) for b in df[df["modality"] == "image"]["bina
 | `--text-in-pic` | off | Predict text inside images (v1.2+ feature) |
 | `--nemotron-parse-path` | — | Complete local Parse 3.5 repository required for managed Dynamo in `main.py` or the benchmark |
 | `--reuse-encoded-images` | off | Reuse verified rendered PNG bytes for served Parse 3.5 `single` mode only |
+| `--repetition-detection MAX_PATTERN_SIZE MIN_COUNT [MIN_PATTERN_SIZE]` | off | Stop a repeated generation and retain the page as a failure. Use `--pages-per-task` and an external vLLM endpoint that declares the field in its OpenAPI schema. A gateway must forward it to every identically configured replica. The extraction config must record the same values. Both launchers reject this option unless `--inference-server-endpoint` is given. See [Stop Repeated Output](../../../fern/versions/main/pages/curate-text/load-data/nemotron-parse-pdf.mdx#stop-repeated-output). |
 
 ## Served Nemotron Parse 3.5
 

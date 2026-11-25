@@ -25,6 +25,8 @@ from nemo_curator.stages.interleaved.pdf.nemotron_parse.inference import (
     DEFAULT_MODEL_PATH,
     NemotronParseHTTPClientStage,
     NemotronParseInferenceStage,
+    RepetitionDetection,
+    _validate_repetition_detection,
 )
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import validate_extraction_config
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.partitioning import PDFPartitioningStage
@@ -116,6 +118,12 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     inference_server_reuse_encoded_images
         Reuse verified unchanged producer PNGs in served single mode. Disabled
         by default; unverified images keep the ordinary encoding path.
+    inference_server_repetition_detection
+        ``(max_pattern_size, min_count[, min_pattern_size])``: ask vLLM to end a
+        generation that repeats a pattern ``min_count`` times. Such a page fails
+        with finish reason ``repetition``. Unset by default. Requires
+        pages_per_task, whose extraction configuration must record it, and an
+        external vLLM endpoint whose OpenAPI schema declares the field.
 
     page_budget_extraction_config
         Resolved effective parser, model, request, rendering and projection
@@ -157,6 +165,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
     inference_server_request_timeout_s: float = 300.0
     inference_server_max_retries: int = 3
     inference_server_reuse_encoded_images: bool = field(default=False, kw_only=True)
+    inference_server_repetition_detection: RepetitionDetection | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -169,6 +178,9 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
         ):
             msg = "Encoded image reuse requires served Parse 3.5 single mode"
             raise ValueError(msg)
+        self.inference_server_repetition_detection = _validate_repetition_detection(
+            self.inference_server_repetition_detection, supported=self.pages_per_task is not None
+        )
         if self.manifest_path is None:
             msg = "manifest_path is required"
             raise ValueError(msg)
@@ -227,6 +239,7 @@ class NemotronParsePDFReader(CompositeStage[EmptyTask, InterleavedBatch]):
                 inference_batch_size=self.inference_batch_size,
                 max_tokens=self.max_tokens,
                 reuse_encoded_images=self.inference_server_reuse_encoded_images,
+                repetition_detection=self.inference_server_repetition_detection,
             ).with_(num_workers=self.inference_server_client_num_workers)
         self._postprocessor = NemotronParsePostprocessStage(
             min_crop_px=self.min_crop_px,

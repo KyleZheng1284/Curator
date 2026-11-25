@@ -14,7 +14,10 @@ import pytest
 
 from nemo_curator.stages.interleaved.pdf.nemotron_parse import extraction, inference
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.composite import NemotronParsePDFReader
-from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import ExtractionConfigMismatchError
+from nemo_curator.stages.interleaved.pdf.nemotron_parse.page_budget import (
+    ExtractionConfigMismatchError,
+    output_version,
+)
 from nemo_curator.stages.interleaved.pdf.nemotron_parse.validation import PDFPageBudgetValidationStage
 from nemo_curator.tasks import FileGroupTask
 from tests.stages.interleaved.pdf.nemotron_parse._page_budget_helpers import TEST_EXTRACTION_CONFIG
@@ -70,6 +73,43 @@ def test_changed_effective_settings_fail_before_requests(
         contracted_client.request_timeout_s = 1
     with pytest.raises(ExtractionConfigMismatchError):
         contracted_client.setup()
+
+
+def test_repetition_detection_is_part_of_the_admitted_request(
+    contracted_client: inference.NemotronParseHTTPClientStage,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checks = []
+    monkeypatch.setattr(contracted_client, "_require_repetition_detection", lambda: checks.append(True))
+    unguarded = copy.deepcopy(contracted_client.extraction_config)
+    guarded = copy.deepcopy(unguarded)
+    guarded["request"]["generation"]["extra_kwargs"]["extra_body"]["repetition_detection"] = {
+        "max_pattern_size": 128,
+        "min_count": 200,
+    }
+    assert output_version({"pdf_extraction_config": guarded}) != output_version({"pdf_extraction_config": unguarded})
+
+    explicit = copy.deepcopy(guarded)
+    explicit["request"]["generation"]["extra_kwargs"]["extra_body"]["repetition_detection"]["min_pattern_size"] = 1
+    assert len({output_version({"pdf_extraction_config": c}) for c in (unguarded, guarded, explicit)}) == 3
+
+    # Each worker accepts only the contract that records its own setting.
+    for setting, admitted, refused in (
+        (None, unguarded, guarded),
+        ((128, 200), guarded, unguarded),
+        ((128, 100), None, guarded),
+        ((128, 200, 1), explicit, guarded),
+        ((128, 200), None, explicit),
+        ((128, 200, 8), None, explicit),
+    ):
+        contracted_client.repetition_detection = setting
+        if admitted is not None:
+            contracted_client.extraction_config = copy.deepcopy(admitted)
+            contracted_client.setup()
+        contracted_client.extraction_config = copy.deepcopy(refused)
+        with pytest.raises(ExtractionConfigMismatchError, match="Effective served request"):
+            contracted_client.setup()
+    assert checks == [True, True]
 
 
 def test_contract_failure_is_fatal_not_an_ordinary_failed_page(

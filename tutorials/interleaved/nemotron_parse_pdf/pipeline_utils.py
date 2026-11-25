@@ -153,6 +153,15 @@ def create_nemotron_parse_pdf_argparser() -> argparse.ArgumentParser:
         action="store_true",
         help="Reuse verified producer PNGs in served single mode; otherwise encode normally",
     )
+    parser.add_argument(
+        "--repetition-detection",
+        type=int,
+        nargs="+",
+        metavar="N",
+        help="MAX_PATTERN_SIZE MIN_COUNT [MIN_PATTERN_SIZE]. Stop a generation that repeats a pattern in this "
+        "range MIN_COUNT times. The page fails (requires an external vLLM --inference-server-endpoint, "
+        "--pages-per-task, and matching extraction config)",
+    )
 
     parser.add_argument("--file-name-field", default="file_name", help="JSONL field for single PDF filename")
     parser.add_argument(
@@ -225,6 +234,7 @@ def create_nemotron_parse_pdf_pipeline(
             inference_server_request_timeout_s=getattr(args, "inference_server_request_timeout_s", 300.0),
             inference_server_max_retries=getattr(args, "inference_server_max_retries", 3),
             inference_server_reuse_encoded_images=getattr(args, "reuse_encoded_images", False),
+            inference_server_repetition_detection=getattr(args, "repetition_detection", None),
         )
     )
     pipeline.add_stage(

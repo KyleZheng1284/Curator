@@ -41,6 +41,8 @@ def main() -> None:
     parser.add_argument("--executor", choices=["ray-data", "xenna"], default="ray-data")
     args = parser.parse_args()
 
+    if args.repetition_detection is not None and args.inference_server_endpoint is None:
+        parser.error("--repetition-detection requires an external vLLM --inference-server-endpoint")
     if args.reuse_encoded_images and args.parse_mode != "single":
         parser.error("--reuse-encoded-images requires --parse-mode single")
 

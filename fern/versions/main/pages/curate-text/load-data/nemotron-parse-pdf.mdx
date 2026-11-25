@@ -264,6 +264,7 @@ existing positional reader and HTTP-client calls remain compatible.
 | `inference_server_request_timeout_s` | float | `300.0` | Per-page HTTP request timeout. |
 | `inference_server_max_retries` | int | `3` | Outer Curator retries for errors its client recognizes as rate limits or connection failures; separate from OpenAI SDK retries. |
 | `inference_server_reuse_encoded_images` | bool | `False` | Reuse verified PNG bytes for served Parse 3.5 single-pass full-page requests; see [PNG reuse](#reuse-rendered-png-bytes). |
+| `inference_server_repetition_detection` | tuple[int, int] \| tuple[int, int, int] \| None | `None` | Ask an external vLLM server to stop a repeated generation. The page fails. Requires `pages_per_task` and server support. See [Stop Repeated Output](#stop-repeated-output). |
 
 ### Failure Behavior
 
@@ -454,6 +455,7 @@ With `parse_mode` set, the HTTP stage records these additive custom metrics:
 | `num_requests` | Model requests made by the parser, including crop and detection passes. Internal HTTP retry attempts are not counted separately. |
 | `num_failed_requests` | Parser requests that still raise after HTTP retries. A response that fails output validation can fail the page without failing the HTTP request. |
 | `total_prompt_tokens`, `total_output_tokens` | Reported token usage across parser requests, including responses from pages that later fail. Missing usage is not estimated. |
+| `repetition_stops` | Number of parser requests for which the server returned finish reason `repetition`. See [Stop Repeated Output](#stop-repeated-output). |
 | `inference_server_request_time` | Wall time spent processing the task's pages in the HTTP stage. |
 | `image_reuse_count` | Full-page requests that reused verified producer PNG bytes. |
 | `image_encode_count` | Requests whose image was encoded normally. |
@@ -609,6 +611,75 @@ Aggregate these additive counters with `_sum` as shown in
 [Inspect Inference Metrics](#inspect-inference-metrics). This saves CPU encoding
 work; measure pipeline wall time to determine whether encoding limits your workload.
 It does not require page-based tasking or a separate HTTP-client reuse option.
+
+### Stop Repeated Output
+
+A page whose generation falls into a loop normally runs to the output-token limit
+and fails with finish reason `length`. To stop loops earlier, use
+[page-based tasking](#page-based-tasking) with an external vLLM OpenAI endpoint
+that supports repetition detection. To use the evaluated setting, set
+`inference_server_repetition_detection=(128, 200, 8)` on
+`NemotronParsePDFReader`, or pass `--repetition-detection 128 200 8` together with
+`--inference-server-endpoint` to the tutorial or benchmark. Both launchers require
+an external endpoint when you enable the guard.
+When composing stages directly, set `repetition_detection` on
+`NemotronParseHTTPClientStage`. The option is unset by default, and requests are
+then unchanged.
+
+With two values, every page request carries `max_pattern_size` and `min_count` in
+vLLM's `repetition_detection` field. The server stops when the output ends in
+`min_count` consecutive copies of the same token pattern, and `max_pattern_size` is
+the longest pattern it checks, in tokens. To set the shortest
+pattern the server checks, pass a third integer, for example
+`--repetition-detection 128 200 8` or `(128, 200, 8)`. This adds
+`"min_pattern_size": 8` to the field. The shortest pattern defaults to one token.
+A shorter repeated sequence can still trigger a stop when its copies form a longer
+pattern within the requested range.
+Use integers. Set `min_count` to 2 or more and `max_pattern_size` from 1 to one less
+than the output-token limit.
+The optional `min_pattern_size` accepts integers from 0 through `max_pattern_size`.
+vLLM treats 0 as one token. The minimum pattern must fit `min_count` times before
+the token limit. For example, with an 8,744-token limit
+and 200 required repeats, only patterns of up to 43 tokens can trigger a stop
+before the limit.
+
+<Warning>
+This option changes extraction results. A stopped page is a failed page, so any
+correct text generated before the repetition is not published as page content; the
+raw output is kept in the failed row's `materialize_error`. A page that would
+have finished on its own can also be stopped when its content legitimately repeats,
+such as a long empty ruled table. Choose the settings on a sample of your corpus and
+compare failed pages with the option unset before adopting it.
+</Warning>
+
+- **Outcome.** The parser package accepts only a completed generation, so a stopped
+  page becomes an error row like a page that reaches the token limit. Its
+  `materialize_error` has `type` `GenerationError`, and its `requests` entry records
+  `finish_reason` `repetition` where a token-limit failure records `length`. Other
+  pages of the task are unaffected. The page is not retried.
+- **Metric.** `repetition_stops` counts these requests; aggregate it with `_sum` as
+  shown in [Inspect Inference Metrics](#inspect-inference-metrics).
+- **Extraction contract.** The option requires an extraction contract, and the field
+  is part of its admitted request. Record it at
+  `request.generation.extra_kwargs.extra_body.repetition_detection` as
+  `{"max_pattern_size": 128, "min_count": 200, "min_pattern_size": 8}` for the
+  evaluated setting. Include `min_pattern_size` in the contract when you supply
+  the third value, including an
+  explicit value of 1. Workers refuse a
+  contract that does not match their setting, so outputs produced with the option
+  have a different output version from outputs produced without it.
+- **Server support.** During setup, each guarded worker reads the server's OpenAPI
+  schema at `/openapi.json`, next to the endpoint's `/v1` path, and requires the chat
+  completion request to declare `repetition_detection` with every parameter the
+  option sends. A vLLM server started with `--disable-fastapi-docs` does not publish
+  that schema, so the option cannot be used with it. If you use a gateway, expose the
+  serving engine's schema, configure every replica with the same supported vLLM
+  version, and forward the field unchanged to each replica. An advertised schema
+  alone cannot establish that a gateway forwards the field. If a gateway rejects the
+  field, every page fails with a `parse_request` error; if only some pages fail that
+way, the replicas differ and the populated pages are not all guarded. If it drops the field, looping
+  pages still fail with `finish_reason` `length` in their `requests` entry and
+  `repetition_stops` stays at zero.
 
 ### Page-Based Tasking
 

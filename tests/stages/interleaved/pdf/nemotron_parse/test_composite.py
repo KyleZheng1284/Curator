@@ -243,6 +243,22 @@ def test_overlap_keeps_page_tasking_and_inference_worker_settings() -> None:
     assert overlap.renderer.persistent_rendering
 
 
+def test_repetition_detection_reaches_the_http_stage_and_requires_page_mode() -> None:
+    served = {
+        "manifest_path": "manifest.jsonl",
+        "parse_mode": "single",
+        "inference_server_endpoint": "http://served/v1",
+    }
+    page_mode = {**served, "pages_per_task": 64, "page_budget_extraction_config": TEST_EXTRACTION_CONFIG}
+
+    assert NemotronParsePDFReader(**page_mode)._inference.repetition_detection is None
+    reader = NemotronParsePDFReader(**page_mode, inference_server_repetition_detection=(128, 200))
+    assert reader._inference.repetition_detection == (128, 200)
+    for unrecorded in ({"manifest_path": "manifest.jsonl"}, served):
+        with pytest.raises(ValueError, match="Repetition detection requires served Parse"):
+            NemotronParsePDFReader(**unrecorded, inference_server_repetition_detection=(128, 200))
+
+
 def test_custom_raster_cap_requires_matching_extraction_identity() -> None:
     with pytest.raises(ValueError, match="does not match rendering settings"):
         NemotronParsePDFReader(

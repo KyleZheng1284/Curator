@@ -706,3 +706,37 @@ def test_render_left_by_a_call_that_never_ran_is_discarded(
     assert after.to_pyarrow().equals(whole.to_pyarrow())
     served = [_served_page(body["messages"][0]["content"][1]["image_url"]["url"]) for body in http_endpoint.requests]
     assert sorted(owner[page] for page in served) == [2, 2, 2]
+
+
+def test_page_the_server_stops_for_repetition_is_a_counted_failure_beside_its_task_s_other_pages(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    http_endpoint: SimpleNamespace,  # noqa: F811
+) -> None:
+    renderer, parser, (parent,) = _stages(http_endpoint.endpoint, tmp_path, monkeypatch)
+    setting = {"max_pattern_size": 128, "min_count": 200, "min_pattern_size": 8}
+    parser.repetition_detection = (128, 200, 8)
+    parser.extraction_config["request"]["generation"]["extra_kwargs"]["extra_body"]["repetition_detection"] = setting
+    monkeypatch.setattr(
+        renderer, "_render_with_timeout", lambda _data, name, *_a, **_k: [Image.new("RGB", (40, 25), Path(name).stem)]
+    )
+    blue = base64.b64encode(image_to_bytes(Image.new("RGB", (40, 25), "blue"))).decode("ascii")
+    http_endpoint.outputs["data:image/png;base64," + blue] = ("<x_0.1><y_0.1>" + "0 " * 50, "repetition")
+
+    fused = _early_admission.EarlyAdmissionStage(renderer, parser, stream_page_tasks=True)
+    fused.setup()
+    try:
+        rows = {row["pdf_name"]: row for row in fused.process(parent).to_pyarrow().to_pylist()}
+        metrics = dict(fused._custom_metrics)
+    finally:
+        fused.teardown()
+
+    assert [body["repetition_detection"] for body in http_endpoint.requests] == 2 * [setting]
+    stopped = json.loads(rows["blue.pdf"]["materialize_error"])
+    assert (stopped["stage"], stopped["type"]) == ("fullpage", "GenerationError")
+    assert [request["finish_reason"] for request in stopped["requests"]] == ["repetition"]
+    assert rows["blue.pdf"]["parse_document"] is None
+    assert json.loads(rows["red.pdf"]["parse_document"])["blocks"]
+    assert not rows["red.pdf"]["materialize_error"]
+    assert json.loads(rows["missing.pdf"]["materialize_error"])["type"] == "PDFError"
+    assert (metrics["repetition_stops"], metrics["num_valid_pages"], metrics["num_error_pages"]) == (1, 1, 2)
